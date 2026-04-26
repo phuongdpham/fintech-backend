@@ -1,0 +1,37 @@
+# Build artifacts
+node_modules/
+dist/
+coverage/
+.nx/
+*.log
+
+# Go binaries / test outputs
+**/bin/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# Env files — only .example variants are committed
+.env
+**/.env
+!.env.example
+!**/.env.example
+
+# Editor / IDE
+.idea/
+.vscode/
+.DS_Store
+
+# Claude Code per-user settings — contains permission overrides, not source
+.claude/
+
+# Archive artifacts
+*.tar
+*.tar.*
+*.tgz
+*.zip
+*.sig

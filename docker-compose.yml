@@ -1,0 +1,68 @@
+services:
+  postgres:
+    image: postgres:18-alpine
+    container_name: ledger-db
+    environment:
+      POSTGRES_DB: ledger_db
+      POSTGRES_USER: phuong_dev
+      POSTGRES_PASSWORD: ledger_secret
+    ports:
+      - "5432:5432"
+    volumes:
+      # Postgres 18+ official image lays data out as
+      # /var/lib/postgresql/<major>/docker so pg_upgrade --link can run
+      # without crossing a mount-point boundary. Mount the parent dir
+      # rather than .../data and let the image manage versioning.
+      - pgdata:/var/lib/postgresql
+      - ./postgresql.conf:/etc/postgresql/postgresql.conf
+    command: ["postgres", "-c", "config_file=/etc/postgresql/postgresql.conf"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U phuong_dev -d ledger_db"]
+      interval: 5s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          memory: 6G
+          cpus: '4.0'
+
+  redis:
+    image: redis:8.0-alpine
+    container_name: ledger-cache
+    ports:
+      - "6379:6379"
+    command: >
+      redis-server 
+      --maxmemory 512mb 
+      --maxmemory-policy allkeys-lru 
+      --save 60 1
+      --io-threads 4
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+
+  # Redpanda is wire-compatible with the Kafka API (>=3.x), so the
+  # confluent-kafka-go producer used by ledger-svc + reconciler talks to
+  # it unchanged. dev-container mode auto-sizes for a single-node local
+  # broker (no quorum, no replication).
+  redpanda:
+    image: docker.redpanda.com/redpandadata/redpanda:latest
+    container_name: ledger-events
+    command:
+      - redpanda
+      - start
+      - --mode=dev-container
+      - --smp=1
+      - --kafka-addr=PLAINTEXT://0.0.0.0:9092
+      - --advertise-kafka-addr=PLAINTEXT://localhost:9092
+    ports:
+      - "9092:9092"  # Kafka API
+      - "9644:9644"  # Admin API (rpk targets this)
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health 2>&1 | grep -qE '^\\s*Healthy:\\s+true'"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  pgdata:

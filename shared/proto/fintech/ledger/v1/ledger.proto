@@ -1,0 +1,77 @@
+syntax = "proto3";
+
+package fintech.ledger.v1;
+
+import "google/protobuf/timestamp.proto";
+
+// JournalEntry is one leg of a balanced double-entry transaction.
+//
+// Sign convention: negative = debit, positive = credit. The signs of
+// every leg in a transaction MUST sum to zero — enforced both in the
+// service (domain.AssertBalanced) and in PostgreSQL.
+message JournalEntry {
+  // UUID of the entry (server-generated).
+  string id          = 1;
+  // UUID of the owning transaction.
+  string transaction_id = 2;
+  // UUID of the account this leg books against.
+  string account_id  = 3;
+  // Decimal as string. The DB column is NUMERIC(19,4); JSON / proto
+  // string preserves precision across language boundaries. Parsers
+  // MUST use an arbitrary-precision decimal type.
+  string amount      = 4;
+  // ISO-4217 alphabetic code, e.g. "USD", "EUR", "VND".
+  string currency    = 5;
+  google.protobuf.Timestamp created_at = 6;
+}
+
+// Transaction is the aggregate that owns a balanced set of JournalEntry legs.
+message Transaction {
+  string id              = 1;
+  string idempotency_key = 2;
+  // Server-side state. Currently {COMMITTED, REVERSED}.
+  string status          = 3;
+  repeated JournalEntry entries = 4;
+  google.protobuf.Timestamp created_at = 5;
+}
+
+// TransferRequest is the input to LedgerService.Transfer.
+//
+// Server generates the transaction id and journal-entry ids. The amount
+// is signed POSITIVE — the server constructs the debit (-amount) and
+// credit (+amount) legs internally.
+message TransferRequest {
+  // Caller-supplied; uniquely identifies this transfer for at-most-once
+  // semantics. Replays of the same key return the original transaction.
+  string idempotency_key = 1;
+  // UUID of the account being debited.
+  string from_account_id = 2;
+  // UUID of the account being credited.
+  string to_account_id   = 3;
+  // Decimal-as-string. MUST be strictly positive.
+  string amount          = 4;
+  string currency        = 5;
+}
+
+message TransferResponse {
+  Transaction transaction = 1;
+  // True when this response was reconstructed from a prior request under
+  // the same idempotency_key. The Transaction is the original; no new
+  // ledger row was written.
+  bool replayed = 2;
+}
+
+message GetTransactionRequest {
+  string id = 1;
+}
+
+message GetTransactionResponse {
+  Transaction transaction = 1;
+}
+
+// LedgerService is the write + read API for the double-entry ledger.
+// All Transfer RPCs are idempotent on idempotency_key.
+service LedgerService {
+  rpc Transfer       (TransferRequest)       returns (TransferResponse);
+  rpc GetTransaction (GetTransactionRequest) returns (GetTransactionResponse);
+}

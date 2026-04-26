@@ -1,0 +1,11 @@
+go 1.26.2
+
+use (
+	./apps/compliance-cli
+	./apps/gateway-svc
+	./apps/ledger-svc
+	./libs/go/finance
+	./libs/go/kafkautil
+	./libs/go/logger
+	./libs/go/proto-gen
+)

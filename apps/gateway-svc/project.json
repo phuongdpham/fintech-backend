@@ -1,0 +1,23 @@
+{
+  "name": "gateway-svc",
+  "$schema": "../../node_modules/nx/schemas/project-schema.json",
+  "projectType": "application",
+  "sourceRoot": "apps/gateway-svc",
+  "targets": {
+    "build": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "go build -o ../../dist/gateway-svc",
+        "cwd": "apps/gateway-svc"
+      }
+    },
+    "test": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "go test -v ./...",
+        "cwd": "apps/gateway-svc"
+      }
+    }
+  },
+  "tags": ["lang:go", "scope:app"]
+}

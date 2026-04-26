@@ -1,0 +1,23 @@
+{
+  "name": "compliance-cli",
+  "$schema": "../../node_modules/nx/schemas/project-schema.json",
+  "projectType": "application",
+  "sourceRoot": "apps/compliance-cli",
+  "targets": {
+    "build": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "go build -o ../../dist/compliance-cli",
+        "cwd": "apps/compliance-cli"
+      }
+    },
+    "test": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "go test -v ./...",
+        "cwd": "apps/compliance-cli"
+      }
+    }
+  },
+  "tags": ["lang:go", "scope:app"]
+}

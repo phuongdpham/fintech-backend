@@ -1,0 +1,15 @@
+{
+  "name": "fintech-backend",
+  "version": "0.0.0",
+  "private": true,
+  "packageManager": "pnpm@10.33.0",
+  "scripts": {
+    "build": "nx run-many --target=build",
+    "test": "nx run-many --target=test",
+    "affected:build": "nx affected --target=build --base=origin/main",
+    "affected:test": "nx affected --target=test --base=origin/main"
+  },
+  "devDependencies": {
+    "nx": "^20.3.0"
+  }
+}

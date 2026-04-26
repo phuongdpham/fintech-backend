@@ -1,0 +1,34 @@
+{
+  "name": "ledger-svc",
+  "$schema": "../../node_modules/nx/schemas/project-schema.json",
+  "projectType": "application",
+  "sourceRoot": "apps/ledger-svc",
+  "targets": {
+    "build": {
+      "executor": "nx:run-commands",
+      "options": {
+        "commands": [
+          "go build -o ../../dist/ledger-svc ./cmd/server",
+          "go build -o ../../dist/reconciler ./cmd/reconciler",
+          "go build -o ../../dist/migrate ./cmd/migrate"
+        ],
+        "cwd": "apps/ledger-svc",
+        "parallel": false,
+        "env": {
+          "CGO_ENABLED": "1"
+        }
+      }
+    },
+    "test": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "go test -v ./...",
+        "cwd": "apps/ledger-svc",
+        "env": {
+          "CGO_ENABLED": "1"
+        }
+      }
+    }
+  },
+  "tags": ["lang:go", "scope:app"]
+}

@@ -1,0 +1,42 @@
+name: CI-Quality-Gate
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  quality-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Go 1.26
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+
+      - name: Setup Node & Corepack
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - run: corepack enable pnpm
+
+      - name: Install Dependencies
+        run: pnpm install
+
+      - name: Proto Lint & Generate
+        run: |
+          cd shared/proto
+          buf lint
+          buf generate
+
+      - name: Nx Affected Check (Build/Test)
+        run: |
+          pnpm exec nx affected --target=test --base=origin/main
+          pnpm exec nx affected --target=build --base=origin/main
+
+      - name: Security Audit
+        run: go install golang.org/x/vuln/cmd/govulncheck@latest && govulncheck ./...
