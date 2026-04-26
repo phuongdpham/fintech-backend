@@ -20,31 +20,51 @@ services:
       test: ["CMD-SHELL", "pg_isready -U phuong_dev -d ledger_db"]
       interval: 5s
       retries: 5
+    # Hard ceilings — actual usage is set by postgresql.conf (shared_buffers
+    # in particular). Limit acts as an OOM guard so a runaway query can't
+    # eat the host. Bump when stress-testing with the prod profile.
     deploy:
       resources:
         limits:
-          memory: 6G
-          cpus: '4.0'
+          memory: 1G
+          cpus: '2.0'
 
   redis:
     image: redis:8.0-alpine
     container_name: ledger-cache
     ports:
       - "6379:6379"
+    # --save "" disables RDB snapshots — for a dev cache the persistence
+    # is noise and the periodic fork() inflates RSS briefly. --io-threads
+    # removed: only useful above ~50K ops/s, dev workload doesn't get there.
     command: >
-      redis-server 
-      --maxmemory 512mb 
-      --maxmemory-policy allkeys-lru 
-      --save 60 1
-      --io-threads 4
+      redis-server
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+      --save ""
+      --appendonly no
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
+    deploy:
+      resources:
+        limits:
+          memory: 384M
+          cpus: '1.0'
 
   # Redpanda is wire-compatible with the Kafka API (>=3.x), so the
   # confluent-kafka-go producer used by ledger-svc + reconciler talks to
   # it unchanged. dev-container mode auto-sizes for a single-node local
   # broker (no quorum, no replication).
+  #
+  # Memory tuning — by default seastar's reactor pre-allocates aggressively
+  # and reserves ~1.5G "for the kernel" (irrelevant in a container). The
+  # three flags below cut idle RSS from ~2G to ~512M:
+  #   --memory=512M         caps seastar's actual allocation.
+  #   --reserve-memory=0M   no kernel reservation (we're in a container).
+  #   --overprovisioned     implied by --mode=dev-container, kept explicit
+  #                         as documentation: don't busy-poll, don't assume
+  #                         dedicated hardware.
   redpanda:
     image: docker.redpanda.com/redpandadata/redpanda:latest
     container_name: ledger-events
@@ -53,6 +73,9 @@ services:
       - start
       - --mode=dev-container
       - --smp=1
+      - --memory=512M
+      - --reserve-memory=0M
+      - --overprovisioned
       - --kafka-addr=PLAINTEXT://0.0.0.0:9092
       - --advertise-kafka-addr=PLAINTEXT://localhost:9092
     ports:
@@ -63,6 +86,11 @@ services:
       interval: 10s
       timeout: 5s
       retries: 10
+    deploy:
+      resources:
+        limits:
+          memory: 768M
+          cpus: '2.0'
 
 volumes:
   pgdata:
