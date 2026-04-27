@@ -1,15 +1,21 @@
 name: CI-Quality-Gate
+
 on:
   push:
     branches: [main]
   pull_request:
     branches: [main]
 
+# Opt into Node.js 24 for JS-based actions ahead of GitHub's June 2026
+# default flip. Harmless once that flip lands; remove afterwards.
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+
 jobs:
   quality-gate:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
@@ -17,12 +23,19 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version: '1.26'
+          # Workspace uses go.work — each module has its own go.sum.
+          # Glob the lot so the toolchain cache key reflects every
+          # module's deps, not a phantom root go.sum.
+          cache-dependency-path: '**/go.sum'
 
       - name: Setup Node & Corepack
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           node-version: '20'
       - run: corepack enable pnpm
+
+      - name: Setup Buf
+        uses: bufbuild/buf-setup-action@v1
 
       - name: Install Dependencies
         run: pnpm install
@@ -33,10 +46,27 @@ jobs:
           buf lint
           buf generate
 
-      - name: Nx Affected Check (Build/Test)
+      # Push to main: run everything (validate the merge target).
+      # PR: run only what's affected vs. base for fast feedback.
+      - name: Build & Test
         run: |
-          pnpm exec nx affected --target=test --base=origin/main
-          pnpm exec nx affected --target=build --base=origin/main
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            pnpm exec nx affected --target=test --base=origin/main
+            pnpm exec nx affected --target=build --base=origin/main
+          else
+            pnpm exec nx run-many --target=test
+            pnpm exec nx run-many --target=build
+          fi
 
+      # govulncheck doesn't follow go.work — it needs a go.mod in the
+      # working directory. Loop over every module the workspace includes.
       - name: Security Audit
-        run: go install golang.org/x/vuln/cmd/govulncheck@latest && govulncheck ./...
+        env:
+          CGO_ENABLED: '1'
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          for d in $(find apps libs -name go.mod -exec dirname {} \;); do
+            echo "::group::govulncheck $d"
+            (cd "$d" && govulncheck ./...)
+            echo "::endgroup::"
+          done
