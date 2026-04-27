@@ -3,20 +3,17 @@
 # Owns: docker-compose stack lifecycle, monorepo-wide nx, proto generation.
 # Service workflows live in their own Makefiles, reachable via:
 #
-#   make -C apps/ledger-svc <target>
-#   make -C apps/<future-service> <target>
+#   make -C apps/<svc> <target>
 #
-# Why split: services have different needs. ledger-svc owns migrations;
-# a BFF or gateway will not. Co-locating each service's Makefile with its
-# code keeps "the things ledger-svc needs to run" in one place, and
-# prevents this root file from becoming a junk drawer of every service's
-# verbs prefixed by name.
+# Why split: services have different needs. Some own database migrations,
+# some don't. Co-locating each service's verbs with its code keeps the
+# root file an orchestration layer rather than a junk drawer of every
+# service's targets prefixed by name.
 #
 # Env layering:
 #   * Root .env: shared infra coords (DATABASE_URL, POSTGRES_*, REDIS_URL,
-#     KAFKA_BROKERS). Loaded here for compose's sake (POSTGRES_USER /
-#     POSTGRES_DB are referenced by wait-postgres) and inherited by any
-#     `make -C` child invocations.
+#     KAFKA_BROKERS). Loaded here for compose's sake and inherited by
+#     any `make -C` child invocations.
 #   * Per-service .env: app-internal knobs. Loaded by the service's
 #     Makefile AND by the service binary at runtime via godotenv.
 # CI can override either by exporting variables before `make`.
@@ -27,6 +24,15 @@ export
 endif
 
 COMPOSE := docker compose
+
+# Auto-discover service directories that define a migrate-up target.
+# Stateless services (no schema of their own) simply omit the target
+# from their Makefile and are skipped automatically — adding a new
+# stateful service requires no edit to this file.
+SERVICES_WITH_MIGRATIONS := $(shell \
+	for mf in apps/*/Makefile; do \
+		grep -lE '^migrate-up:' "$$mf" 2>/dev/null | xargs -r dirname; \
+	done)
 
 .DEFAULT_GOAL := help
 
@@ -56,10 +62,9 @@ proto-gen:  ## Regenerate gRPC stubs from shared/proto
 
 ##@ Stack (shared infra)
 .PHONY: stack-up
-stack-up: compose-up wait-postgres  ## Bring up shared infra + apply ledger-svc migrations
-	$(MAKE) -C apps/ledger-svc migrate-up
+stack-up: compose-up wait-postgres migrate-all  ## Bring up shared infra + apply all service migrations
 	@echo ""
-	@echo "Stack up. Run a service:  make -C apps/ledger-svc run-server"
+	@echo "Stack up. Run a service:  make -C apps/<svc> run-server"
 
 .PHONY: stack-down
 stack-down:  ## Stop and DELETE the docker-compose stack (drops pgdata volume)
@@ -76,18 +81,37 @@ compose-logs:  ## Tail docker-compose logs
 # wait-postgres polls pg_isready until the container reports ready or we hit
 # a hard 60s ceiling. Avoids the racy "compose up && immediately migrate"
 # that fails on a slow first boot. POSTGRES_USER / POSTGRES_DB come from
-# root .env; the shell defaults are last-line-of-defense for fresh clones.
+# root .env — required, no defaults. Forces .env-as-source-of-truth so
+# this file stays free of any service's specific naming.
 .PHONY: wait-postgres
 wait-postgres:  ## Block until Postgres accepts connections (60s ceiling)
+	@if [ -z "$$POSTGRES_USER" ] || [ -z "$$POSTGRES_DB" ]; then \
+		echo "POSTGRES_USER / POSTGRES_DB unset — cp .env.example .env and retry" >&2; \
+		exit 1; \
+	fi
 	@echo "waiting for postgres..."
 	@for i in $$(seq 1 60); do \
 		if $(COMPOSE) exec -T postgres pg_isready \
-			-U $${POSTGRES_USER:-phuong_dev} \
-			-d $${POSTGRES_DB:-ledger_db} >/dev/null 2>&1; then \
+			-U "$$POSTGRES_USER" \
+			-d "$$POSTGRES_DB" >/dev/null 2>&1; then \
 			echo "postgres ready"; exit 0; \
 		fi; sleep 1; \
 	done; \
 	echo "postgres did not become ready within 60s" >&2; exit 1
+
+# migrate-all delegates to every service Makefile that defines migrate-up.
+# Discovery is grep-driven (see SERVICES_WITH_MIGRATIONS at top); no service
+# names are hardcoded here.
+.PHONY: migrate-all
+migrate-all:  ## Apply migrations for every service that defines them
+	@if [ -z "$(SERVICES_WITH_MIGRATIONS)" ]; then \
+		echo "no services with migrate-up targets found"; \
+	else \
+		for d in $(SERVICES_WITH_MIGRATIONS); do \
+			echo ">>> migrate-up: $$d"; \
+			$(MAKE) -C "$$d" migrate-up || exit $$?; \
+		done; \
+	fi
 
 ##@ Cleanup
 .PHONY: clean
