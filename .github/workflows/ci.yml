@@ -28,11 +28,17 @@ jobs:
           # module's deps, not a phantom root go.sum.
           cache-dependency-path: '**/go.sum'
 
-      - name: Setup Node & Corepack
+      # pnpm BEFORE setup-node: setup-node@v5 auto-detects pnpm-lock.yaml
+      # and enables pnpm caching, which fails if pnpm isn't on PATH yet.
+      # action-setup picks the version from package.json's packageManager.
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node 20
         uses: actions/setup-node@v5
         with:
           node-version: '20'
-      - run: corepack enable pnpm
+          cache: 'pnpm'
 
       - name: Setup Buf
         uses: bufbuild/buf-setup-action@v1
