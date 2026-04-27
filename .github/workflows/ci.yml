@@ -29,10 +29,10 @@ jobs:
       - name: Setup pnpm
         uses: pnpm/action-setup@v5
 
-      - name: Setup Node 20
+      - name: Setup Node 24
         uses: actions/setup-node@v6
         with:
-          node-version: '20'
+          node-version: '24'
           cache: 'pnpm'
 
       # Install buf from its release directly. Avoids depending on
