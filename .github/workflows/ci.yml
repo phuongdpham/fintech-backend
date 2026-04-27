@@ -103,7 +103,7 @@ jobs:
       # toolchain bump invalidates cleanly. Coarse cache, shared across
       # every matrix shard.
       - name: Cache Go module downloads
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/go/pkg/mod
           key: go-mod-${{ runner.os }}-go${{ env.GO_VERSION }}-${{ hashFiles('**/go.sum') }}
@@ -119,7 +119,7 @@ jobs:
       # Source hash is scoped to THIS app's directory plus libs/ — editing
       # gateway-svc no longer invalidates ledger-svc's build cache.
       - name: Cache Go build
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.cache/go-build
           key: go-build-${{ runner.os }}-go${{ env.GO_VERSION }}-${{ matrix.app }}-${{ hashFiles('**/go.sum') }}-${{ hashFiles(format('apps/{0}/**/*.go', matrix.app), 'libs/**/*.go') }}
@@ -163,7 +163,7 @@ jobs:
 
       # Same module cache key as build-test → both jobs share the blob.
       - name: Cache Go module downloads
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/go/pkg/mod
           key: go-mod-${{ runner.os }}-go${{ env.GO_VERSION }}-${{ hashFiles('**/go.sum') }}
@@ -173,7 +173,7 @@ jobs:
       # govulncheck binary itself — small, but caching skips the
       # `go install` on hit.
       - name: Cache govulncheck binary
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/go/bin/govulncheck
           key: govulncheck-${{ runner.os }}-go${{ env.GO_VERSION }}-latest
