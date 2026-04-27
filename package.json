@@ -10,6 +10,11 @@
     "affected:test": "nx affected --target=test --base=origin/main"
   },
   "devDependencies": {
-    "nx": "^20.3.0"
+    "nx": "22.7.0"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "nx"
+    ]
   }
 }

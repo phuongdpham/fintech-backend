@@ -30,6 +30,7 @@ coverage/
 # (CLAUDE.md, skills/, agents/, commands/) is tracked so the team gets
 # shared instructions and skills.
 .claude/settings.local.json
+.claude/worktrees/
 
 # Archive artifacts
 *.tar
