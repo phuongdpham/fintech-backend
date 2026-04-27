@@ -6,26 +6,27 @@ on:
   pull_request:
     branches: [main]
 
+# Pinned at the workflow level so every job's setup-go AND every cache
+# key reference the same Go version. Bumping is one line.
+env:
+  GO_VERSION: '1.26'
+
 jobs:
-  quality-gate:
+  # ---------------------------------------------------------------------------
+  # Detect which apps are affected by this change and lint the protos.
+  # On PR: nx affected vs the target branch — only changed apps go to matrix.
+  # On push to main: every app, every time (validate the merge target).
+  # ---------------------------------------------------------------------------
+  setup:
     runs-on: ubuntu-latest
+    outputs:
+      apps: ${{ steps.detect.outputs.apps }}
+      has-apps: ${{ steps.detect.outputs.has-apps }}
     steps:
       - uses: actions/checkout@v6
         with:
-          fetch-depth: 0
+          fetch-depth: 0  # nx affected needs git history
 
-      - name: Setup Go 1.26
-        uses: actions/setup-go@v6
-        with:
-          go-version: '1.26'
-          # Workspace uses go.work — each module has its own go.sum.
-          # Glob the lot so the toolchain cache key reflects every
-          # module's deps, not a phantom root go.sum.
-          cache-dependency-path: '**/go.sum'
-
-      # pnpm BEFORE setup-node: setup-node auto-detects pnpm-lock.yaml
-      # and enables pnpm caching, which fails if pnpm isn't on PATH yet.
-      # action-setup picks the version from package.json's packageManager.
       - name: Setup pnpm
         uses: pnpm/action-setup@v5
 
@@ -35,10 +36,7 @@ jobs:
           node-version: '24'
           cache: 'pnpm'
 
-      # Install buf from its release directly. Avoids depending on
-      # bufbuild/buf-setup-action (still Node-20 JS) and pins the version
-      # so CI proto generation is reproducible. Bump BUF_VERSION
-      # deliberately when adopting new buf features.
+      # buf is a single binary — pinned so proto generation is reproducible.
       - name: Setup Buf
         env:
           BUF_VERSION: '1.68.4'
@@ -48,10 +46,9 @@ jobs:
             "https://github.com/bufbuild/buf/releases/download/v${BUF_VERSION}/buf-Linux-x86_64"
           chmod +x "$HOME/.local/bin/buf"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-          "$HOME/.local/bin/buf" --version
 
       - name: Install Dependencies
-        run: pnpm install
+        run: pnpm install --frozen-lockfile
 
       - name: Proto Lint & Generate
         run: |
@@ -59,27 +56,139 @@ jobs:
           buf lint
           buf generate
 
-      # Push to main: run everything (validate the merge target).
-      # PR: run only what's affected vs. base for fast feedback.
-      - name: Build & Test
+      # On push: every app. On PR: only affected. Output is JSON suitable
+      # for `fromJSON` in the matrix below; empty-array sets has-apps=false
+      # so the downstream job can be skipped cleanly.
+      - id: detect
         run: |
           if [[ "${{ github.event_name }}" == "pull_request" ]]; then
-            pnpm exec nx affected --target=test --base=origin/main
-            pnpm exec nx affected --target=build --base=origin/main
+            APPS=$(pnpm exec nx show projects --affected --base="origin/${{ github.base_ref }}" --type=app --json)
           else
-            pnpm exec nx run-many --target=test
-            pnpm exec nx run-many --target=build
+            APPS=$(pnpm exec nx show projects --type=app --json)
           fi
+          echo "apps=$APPS" >> "$GITHUB_OUTPUT"
+          if [ "$APPS" = "[]" ]; then
+            echo "has-apps=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "has-apps=true" >> "$GITHUB_OUTPUT"
+          fi
+          echo "affected apps: $APPS"
+
+  # ---------------------------------------------------------------------------
+  # Build + test, one matrix shard per affected app. fail-fast: false so a
+  # failure in one app doesn't cancel the others — see all failures in one run.
+  # ---------------------------------------------------------------------------
+  build-test:
+    needs: setup
+    if: needs.setup.outputs.has-apps == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        app: ${{ fromJSON(needs.setup.outputs.apps) }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup Go ${{ env.GO_VERSION }}
+        uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          # Manage caches ourselves below — setup-go's built-in cache
+          # bundles modules + build into one blob, which prevents the
+          # per-app split we want for the build cache.
+          cache: false
+
+      # Go module download cache (~/go/pkg/mod). Modules are not compiler-
+      # version-sensitive, but we key on Go version anyway so a future
+      # toolchain bump invalidates cleanly. Coarse cache, shared across
+      # every matrix shard.
+      - name: Cache Go module downloads
+        uses: actions/cache@v4
+        with:
+          path: ~/go/pkg/mod
+          key: go-mod-${{ runner.os }}-go${{ env.GO_VERSION }}-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            go-mod-${{ runner.os }}-go${{ env.GO_VERSION }}-
+
+      # Go build cache (~/.cache/go-build). Keyed per-app with a layered
+      # restore-key hierarchy so the cache stays warm across:
+      #   - identical commit              (exact key match)
+      #   - same deps, source change      (tier 1: drops the source hash)
+      #   - same app, anything else       (tier 2: drops the deps hash)
+      #
+      # Source hash is scoped to THIS app's directory plus libs/ — editing
+      # gateway-svc no longer invalidates ledger-svc's build cache.
+      - name: Cache Go build
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/go-build
+          key: go-build-${{ runner.os }}-go${{ env.GO_VERSION }}-${{ matrix.app }}-${{ hashFiles('**/go.sum') }}-${{ hashFiles(format('apps/{0}/**/*.go', matrix.app), 'libs/**/*.go') }}
+          restore-keys: |
+            go-build-${{ runner.os }}-go${{ env.GO_VERSION }}-${{ matrix.app }}-${{ hashFiles('**/go.sum') }}-
+            go-build-${{ runner.os }}-go${{ env.GO_VERSION }}-${{ matrix.app }}-
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v5
+
+      - name: Setup Node 24
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          cache: 'pnpm'
+
+      - name: Install Dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build ${{ matrix.app }}
+        run: pnpm exec nx run ${{ matrix.app }}:build
+
+      - name: Test ${{ matrix.app }}
+        run: pnpm exec nx run ${{ matrix.app }}:test
+
+  # ---------------------------------------------------------------------------
+  # Security audit runs over every Go module — including libs/ — so it
+  # doesn't share the matrix with build-test. Independent of build-test
+  # (no `needs:`) so a failing test doesn't mask a vulnerability.
+  # ---------------------------------------------------------------------------
+  security:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup Go ${{ env.GO_VERSION }}
+        uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+
+      # Same module cache key as build-test → both jobs share the blob.
+      - name: Cache Go module downloads
+        uses: actions/cache@v4
+        with:
+          path: ~/go/pkg/mod
+          key: go-mod-${{ runner.os }}-go${{ env.GO_VERSION }}-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            go-mod-${{ runner.os }}-go${{ env.GO_VERSION }}-
+
+      # govulncheck binary itself — small, but caching skips the
+      # `go install` on hit.
+      - name: Cache govulncheck binary
+        uses: actions/cache@v4
+        with:
+          path: ~/go/bin/govulncheck
+          key: govulncheck-${{ runner.os }}-go${{ env.GO_VERSION }}-latest
 
       # govulncheck doesn't follow go.work — it needs a go.mod in the
       # working directory. Loop over every module the workspace includes.
-      - name: Security Audit
+      - name: govulncheck
         env:
           CGO_ENABLED: '1'
         run: |
-          go install golang.org/x/vuln/cmd/govulncheck@latest
+          if [ ! -x "$HOME/go/bin/govulncheck" ]; then
+            go install golang.org/x/vuln/cmd/govulncheck@latest
+          fi
           for d in $(find apps libs -name go.mod -exec dirname {} \;); do
             echo "::group::govulncheck $d"
-            (cd "$d" && govulncheck ./...)
+            (cd "$d" && "$HOME/go/bin/govulncheck" ./...)
             echo "::endgroup::"
           done
