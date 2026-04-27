@@ -84,6 +84,41 @@ make stack-down
 
 `confluent-kafka-go` links against `librdkafka` — `nx run ledger-svc:build` plumbs `CGO_ENABLED=1`. Bare `go build ./...` from CGO=0 environments will fail; that's expected.
 
+## Go conventions — write idiomatic Go 1.26
+
+When writing or scaffolding Go in this repo, default to modern stdlib and language features. Don't reach for third-party libs for things stdlib now covers, and don't carry forward pre-Go-1.21 patterns.
+
+**Stdlib first (Go 1.21+):**
+- `slices` — `slices.Contains`, `Sort`, `SortFunc`, `Index`, `Equal`, `Concat`, `Chunk`, `BinarySearch`. Don't hand-roll loops for these.
+- `maps` — `maps.Clone`, `Copy`, `Keys`, `Values`, `Equal`. Don't write a key-extraction loop.
+- `cmp` — `cmp.Compare`, `cmp.Or`. For ordering and zero-value-fallback chains.
+- `min`, `max`, `clear` — language builtins, not function calls. Use them.
+- `errors.Join` — accumulate multi-error from a loop instead of `fmt.Errorf("a: %w; b: %w", ...)` strings.
+
+**Language features:**
+- Range-over-func iterators (Go 1.23+) — write `iter.Seq[T]` / `iter.Seq2[K,V]` for streaming APIs. Consumers use `for x := range myIter { ... }`. Beats hand-rolled callback-style or channel-based iteration.
+- `for i := range N` (Go 1.22+) — integer range. Don't write `for i := 0; i < n; i++` anymore for plain counts.
+- Loop variable scoping is per-iteration as of Go 1.22 — don't write `i := i` shadow lines, and don't capture loop vars defensively. (If you see `i := i` in this codebase, it's stale and should go.)
+
+**HTTP / net:**
+- `net/http.ServeMux` path patterns (Go 1.22+) — `mux.HandleFunc("GET /users/{id}", h)`. Don't pull in chi/gorilla for plain routing unless you need middleware composition the stdlib doesn't have.
+- `context.AfterFunc` (Go 1.21+) — registers a callback when ctx is done. Cleaner than `go func() { <-ctx.Done(); cleanup() }()`.
+
+**Concurrency:**
+- `sync.OnceFunc`, `sync.OnceValue`, `sync.OnceValues` (Go 1.21+) — beats `sync.Once` + global state for memoized init.
+- `errgroup.Group` with `WithContext` from `golang.org/x/sync` is fine; stdlib doesn't have an equivalent.
+
+**Testing:**
+- `t.Context()` (Go 1.24+) — auto-cancelled at test end. Beats manual `context.WithCancel(context.Background())` per test.
+- `testing/synctest` (Go 1.24+ experimental, 1.25 GA) — use for time-dependent tests instead of real clock + sleeps.
+
+**go.mod:**
+- Use the `toolchain` directive when pinning a specific Go patch — `go 1.26` declares the language version, `toolchain go1.26.x` declares the build version. They're separate concerns now.
+
+**When in doubt:**
+- Check the Go release notes for 1.21 → current before reaching for a third-party package: <https://go.dev/doc/devel/release>. The "What's new in Go 1.X" sections list every new stdlib API.
+- My (Claude's) knowledge cutoff is January 2026 — for anything that landed in Go 1.26.x patch releases or later, treat my suggestions as a starting point and verify against current release notes via WebFetch.
+
 ## Pending work
 
 - BFF (GraphQL) — separate service that fronts ledger-svc + future gateway-svc.

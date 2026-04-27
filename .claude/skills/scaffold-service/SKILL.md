@@ -153,6 +153,12 @@ make -C apps/<name> test    # should pass with zero tests (no failures)
 
 If any of those fail, do NOT report success — fix the scaffold first.
 
+## Idiomatic Go 1.26
+
+Whatever you write in `cmd/server/main.go`, `internal/config/config.go`, etc. should use modern Go from the start. Pull from `.claude/CLAUDE.md`'s "Go conventions" section — `slices`/`maps`/`cmp`, `errors.Join`, range-over-func iterators where natural, `for i := range N`, `net/http.ServeMux` path patterns, `t.Context()` in tests. No `i := i` shadowing, no hand-rolled `Contains`/`Sort`, no custom min/max funcs.
+
+Verify against <https://go.dev/doc/devel/release> when in doubt; my training cutoff is Jan 2026 so very-recent 1.26.x patches may need a check.
+
 ## Reporting back
 
 Tell the user:
