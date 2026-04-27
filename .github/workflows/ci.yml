@@ -6,8 +6,9 @@ on:
   pull_request:
     branches: [main]
 
-# Opt into Node.js 24 for JS-based actions ahead of GitHub's June 2026
-# default flip. Harmless once that flip lands; remove afterwards.
+# buf-setup-action@v1 is still on the Node 20 runtime. Force it (and any
+# future Node-20 stragglers) onto Node 24 ahead of GitHub's June 2026
+# default flip. Drop this env once buf-setup ships a Node-24 release.
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
 
@@ -15,12 +16,12 @@ jobs:
   quality-gate:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
       - name: Setup Go 1.26
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version: '1.26'
           # Workspace uses go.work — each module has its own go.sum.
@@ -28,14 +29,14 @@ jobs:
           # module's deps, not a phantom root go.sum.
           cache-dependency-path: '**/go.sum'
 
-      # pnpm BEFORE setup-node: setup-node@v5 auto-detects pnpm-lock.yaml
+      # pnpm BEFORE setup-node: setup-node auto-detects pnpm-lock.yaml
       # and enables pnpm caching, which fails if pnpm isn't on PATH yet.
       # action-setup picks the version from package.json's packageManager.
       - name: Setup pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@v5
 
       - name: Setup Node 20
-        uses: actions/setup-node@v5
+        uses: actions/setup-node@v6
         with:
           node-version: '20'
           cache: 'pnpm'
