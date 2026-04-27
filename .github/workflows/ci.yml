@@ -42,6 +42,10 @@ jobs:
 
       - name: Setup Buf
         uses: bufbuild/buf-setup-action@v1
+        with:
+          # Avoid stricter unauthenticated rate limits when buf hits the
+          # GitHub release API to download itself.
+          github_token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install Dependencies
         run: pnpm install
