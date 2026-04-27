@@ -19,5 +19,6 @@
       }
     }
   },
+  "implicitDependencies": ["logger"],
   "tags": ["lang:go", "scope:app"]
 }

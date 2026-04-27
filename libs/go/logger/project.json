@@ -1,0 +1,7 @@
+{
+  "name": "logger",
+  "$schema": "../../../node_modules/nx/schemas/project-schema.json",
+  "projectType": "library",
+  "sourceRoot": "libs/go/logger",
+  "tags": ["lang:go", "scope:lib"]
+}

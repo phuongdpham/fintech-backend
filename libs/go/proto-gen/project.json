@@ -1,0 +1,8 @@
+{
+  "name": "proto-gen",
+  "$schema": "../../../node_modules/nx/schemas/project-schema.json",
+  "projectType": "library",
+  "sourceRoot": "libs/go/proto-gen",
+  "implicitDependencies": ["proto-schemas"],
+  "tags": ["lang:go", "scope:lib", "kind:generated"]
+}

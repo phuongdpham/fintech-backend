@@ -30,5 +30,6 @@
       }
     }
   },
+  "implicitDependencies": ["proto-gen"],
   "tags": ["lang:go", "scope:app"]
 }
