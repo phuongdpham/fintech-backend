@@ -6,12 +6,6 @@ on:
   pull_request:
     branches: [main]
 
-# buf-setup-action@v1 is still on the Node 20 runtime. Force it (and any
-# future Node-20 stragglers) onto Node 24 ahead of GitHub's June 2026
-# default flip. Drop this env once buf-setup ships a Node-24 release.
-env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
-
 jobs:
   quality-gate:
     runs-on: ubuntu-latest
@@ -41,12 +35,20 @@ jobs:
           node-version: '20'
           cache: 'pnpm'
 
+      # Install buf from its release directly. Avoids depending on
+      # bufbuild/buf-setup-action (still Node-20 JS) and pins the version
+      # so CI proto generation is reproducible. Bump BUF_VERSION
+      # deliberately when adopting new buf features.
       - name: Setup Buf
-        uses: bufbuild/buf-setup-action@v1
-        with:
-          # Avoid stricter unauthenticated rate limits when buf hits the
-          # GitHub release API to download itself.
-          github_token: ${{ secrets.GITHUB_TOKEN }}
+        env:
+          BUF_VERSION: '1.68.4'
+        run: |
+          mkdir -p "$HOME/.local/bin"
+          curl -fsSL -o "$HOME/.local/bin/buf" \
+            "https://github.com/bufbuild/buf/releases/download/v${BUF_VERSION}/buf-Linux-x86_64"
+          chmod +x "$HOME/.local/bin/buf"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/buf" --version
 
       - name: Install Dependencies
         run: pnpm install
