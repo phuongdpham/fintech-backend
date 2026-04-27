@@ -26,8 +26,10 @@ coverage/
 .vscode/
 .DS_Store
 
-# Claude Code per-user settings — contains permission overrides, not source
-.claude/
+# Claude Code per-user state — NOT shared. Everything else under .claude/
+# (CLAUDE.md, skills/, agents/, commands/) is tracked so the team gets
+# shared instructions and skills.
+.claude/settings.local.json
 
 # Archive artifacts
 *.tar
