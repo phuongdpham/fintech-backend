@@ -56,6 +56,21 @@ OTel uses `StatsHandler(otelgrpc.NewServerHandler())`, not the legacy intercepto
 - **Table-driven tests.** Default everywhere; `t.Run(tc.name, ...)` per case.
 - **DDD-style domain.** Aggregates, value objects, sentinel errors. Push back on anemic models.
 
+## Writing voice (commits, PRs, docs, comments, ADRs, READMEs)
+
+One bar for everything written for humans to read later: **plain, short, clear, useful**. Same voice as a teammate explaining the change at a desk, not a press release or a thesis.
+
+- **Plain words over fancy ones.** "use" not "utilize", "use" not "leverage", "fix" not "remediate", "speed up" not "optimize", "split" not "decompose", "make" not "facilitate". If a shorter common word fits, use it.
+- **No marketing or academic register.** Drop "comprehensive", "robust", "seamless", "elegant", "powerful", "first-class", "industry-leading", "state-of-the-art", "delve", "in order to", "it is worth noting that", "we hereby". Drop "this PR introduces / this commit adds" preambles — just say what changed.
+- **No AI tells.** No em-dash bulleting, no "Certainly!", no "Let's dive in", no closing summaries that restate the body, no "I hope this helps".
+- **Emoji and symbols are noise unless they carry meaning.** No decorative emoji, no ✅/❌/🚀/🎉 in commits or PRs. OK only when functional: a status table, a runbook checklist, a UI string. When in doubt, omit.
+- **Explain the *why* once, not the *what* repeatedly.** The diff/code already shows what changed; words exist to add the reason, the constraint, or the gotcha that isn't visible.
+- **Length follows substance.** A two-line change deserves a two-line message. A subtle bug fix may deserve a paragraph on the *why*. Don't pad to look thorough; don't truncate when context is load-bearing.
+- **Concrete over abstract.** Name the file, the function, the metric, the failure mode. "fixes 40001 retry on outbox drain" beats "improves resilience".
+- **Active voice, present tense for commits/PRs** ("add idempotency check", not "added" or "adds an idempotency check that has been implemented").
+
+Commit shape: imperative subject ≤ 50 chars; body wraps at ~72, max ~5 lines; if it wants more, split. PR title imperative ≤ 70 chars; body bullets over paragraphs; one-sentence summary or split.
+
 ## Run cheatsheet
 
 ```sh
