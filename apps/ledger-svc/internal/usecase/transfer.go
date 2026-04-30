@@ -203,6 +203,28 @@ func buildPreflightTransaction(in TransferInput) *domain.Transaction {
 // headroom without exposing Redis / PG to a megabyte-key DoS.
 const idempotencyKeyMaxLen = 64
 
+// idempotencyKeyAllowed restricts the charset to alphanumerics, hyphen,
+// and underscore. Two reasons:
+//   - We use ':' as the tenant/key separator in scopedIdempotencyKey;
+//     a key containing ':' would break that contract.
+//   - Excluding control chars and whitespace removes a class of log
+//     poisoning and Redis-protocol oddities. UUIDs and URL-safe base64
+//     fit this set, which covers every realistic caller shape.
+func idempotencyKeyAllowed(s string) bool {
+	for i := range len(s) {
+		c := s[i]
+		switch {
+		case c >= '0' && c <= '9':
+		case c >= 'a' && c <= 'z':
+		case c >= 'A' && c <= 'Z':
+		case c == '-' || c == '_':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
 func validateTransferInput(in TransferInput) error {
 	if in.TenantID == "" {
 		return domain.ErrTenantRequired
@@ -212,6 +234,9 @@ func validateTransferInput(in TransferInput) error {
 	}
 	if len(in.IdempotencyKey) > idempotencyKeyMaxLen {
 		return fmt.Errorf("usecase: idempotency_key exceeds %d bytes", idempotencyKeyMaxLen)
+	}
+	if !idempotencyKeyAllowed(in.IdempotencyKey) {
+		return fmt.Errorf("usecase: idempotency_key must match [A-Za-z0-9_-]+")
 	}
 	if !in.Currency.Valid() {
 		return domain.ErrInvalidCurrency

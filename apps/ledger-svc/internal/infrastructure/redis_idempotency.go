@@ -16,29 +16,40 @@ import (
 	"github.com/phuongdpham/fintech/apps/ledger-svc/internal/domain"
 )
 
-// IdempotencyKeyTTL is the wall-clock window during which Redis answers
-// "duplicate" for a given key. 24h is the plan's spec — long enough to
-// absorb client retries spanning a typical incident, short enough to bound
-// Redis memory.
+// IdempotencyTerminalTTL is the wall-clock window during which Redis
+// answers "duplicate" once the request has terminated (COMPLETED or
+// FAILED). 24h absorbs client retries that span a typical incident
+// without bloating Redis.
 //
-// PostgreSQL's UNIQUE constraint on transactions.idempotency_key remains
-// the durable, last-line-of-defense barrier past this TTL.
-const IdempotencyKeyTTL = 24 * time.Hour
+// IdempotencyStartedTTL is the much shorter window applied while the
+// request is in flight (STARTED). The split exists to unstick a known
+// failure mode: if SetState(FAILED) itself fails to reach Redis after
+// a hard repo error, the slot would otherwise stay STARTED for 24h and
+// every retry would return ErrTransferInFlight. Five minutes bounds
+// that lockout to a single circuit-breaker window. PostgreSQL's
+// composite UNIQUE on (tenant_id, idempotency_key) remains the durable
+// barrier past either TTL.
+const (
+	IdempotencyTerminalTTL = 24 * time.Hour
+	IdempotencyStartedTTL  = 5 * time.Minute
+)
 
 // RedisIdempotencyStore implements domain.IdempotencyStore on top of
 // go-redis/v9. Uses SETNX (SET ... NX ... EX) for the atomic acquire,
 // then GET to surface the current state on collision.
 type RedisIdempotencyStore struct {
-	client redis.UniversalClient
-	prefix string
-	ttl    time.Duration
+	client      redis.UniversalClient
+	prefix      string
+	startedTTL  time.Duration
+	terminalTTL time.Duration
 }
 
 func NewRedisIdempotencyStore(client redis.UniversalClient) *RedisIdempotencyStore {
 	return &RedisIdempotencyStore{
-		client: client,
-		prefix: "ledger:idem:",
-		ttl:    IdempotencyKeyTTL,
+		client:      client,
+		prefix:      "ledger:idem:",
+		startedTTL:  IdempotencyStartedTTL,
+		terminalTTL: IdempotencyTerminalTTL,
 	}
 }
 
@@ -50,11 +61,12 @@ func (s *RedisIdempotencyStore) WithPrefix(prefix string) *RedisIdempotencyStore
 	return &cp
 }
 
-// WithTTL returns a copy of s using the given TTL. Tests use a small TTL
-// to keep eviction deterministic.
-func (s *RedisIdempotencyStore) WithTTL(ttl time.Duration) *RedisIdempotencyStore {
+// WithTTLs returns a copy of s using the given STARTED and terminal
+// TTLs. Tests use small values to keep eviction deterministic.
+func (s *RedisIdempotencyStore) WithTTLs(startedTTL, terminalTTL time.Duration) *RedisIdempotencyStore {
 	cp := *s
-	cp.ttl = ttl
+	cp.startedTTL = startedTTL
+	cp.terminalTTL = terminalTTL
 	return &cp
 }
 
@@ -82,7 +94,7 @@ func (s *RedisIdempotencyStore) Acquire(ctx context.Context, key string) (bool, 
 	if key == "" {
 		return false, "", fmt.Errorf("redis idempotency: key is required")
 	}
-	ok, err := s.client.SetNX(ctx, s.key(key), string(domain.IdempotencyStarted), s.ttl).Result()
+	ok, err := s.client.SetNX(ctx, s.key(key), string(domain.IdempotencyStarted), s.startedTTL).Result()
 	if err != nil {
 		return false, "", fmt.Errorf("redis idempotency: SETNX: %w", err)
 	}
@@ -102,19 +114,24 @@ func (s *RedisIdempotencyStore) Acquire(ctx context.Context, key string) (bool, 
 	return false, state, nil
 }
 
-// SetState writes the new state with the configured TTL. Refreshing the TTL
-// on every transition is intentional: it keeps the duplicate-detection
-// window alive for the full 24h even on long-running flows.
+// SetState writes the new state. STARTED reuses the short startedTTL;
+// terminal states (COMPLETED, FAILED) refresh to the long terminalTTL,
+// keeping the duplicate-detection window open for the full 24h on
+// settled flows.
 func (s *RedisIdempotencyStore) SetState(ctx context.Context, key string, state domain.IdempotencyState) error {
 	if key == "" {
 		return fmt.Errorf("redis idempotency: key is required")
 	}
+	var ttl time.Duration
 	switch state {
-	case domain.IdempotencyStarted, domain.IdempotencyCompleted, domain.IdempotencyFailed:
+	case domain.IdempotencyStarted:
+		ttl = s.startedTTL
+	case domain.IdempotencyCompleted, domain.IdempotencyFailed:
+		ttl = s.terminalTTL
 	default:
 		return fmt.Errorf("redis idempotency: invalid state %q", state)
 	}
-	if err := s.client.Set(ctx, s.key(key), string(state), s.ttl).Err(); err != nil {
+	if err := s.client.Set(ctx, s.key(key), string(state), ttl).Err(); err != nil {
 		return fmt.Errorf("redis idempotency: SET state: %w", err)
 	}
 	return nil
