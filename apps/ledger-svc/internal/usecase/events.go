@@ -18,6 +18,7 @@ import (
 // rename fields or change types in V1; consumers depend on stability.
 type TransferCommittedV1 struct {
 	Schema         string    `json:"schema"`
+	TenantID       string    `json:"tenant_id"`
 	IdempotencyKey string    `json:"idempotency_key"`
 	FromAccountID  uuid.UUID `json:"from_account_id"`
 	ToAccountID    uuid.UUID `json:"to_account_id"`
@@ -34,6 +35,7 @@ const SchemaTransferCommittedV1 = "fintech.ledger.v1.TransferCommitted"
 func MarshalTransferCommittedV1(in TransferInput) ([]byte, error) {
 	evt := TransferCommittedV1{
 		Schema:         SchemaTransferCommittedV1,
+		TenantID:       in.TenantID,
 		IdempotencyKey: in.IdempotencyKey,
 		FromAccountID:  in.FromAccountID,
 		ToAccountID:    in.ToAccountID,
@@ -50,7 +52,12 @@ func MarshalTransferCommittedV1(in TransferInput) ([]byte, error) {
 // TransferInput is the public input shape for Transfer.Execute.
 // Defined here (not transfer.go) so the codec can refer to it without
 // a circular pull.
+//
+// TenantID is sourced from the authenticated principal (gRPC auth
+// interceptor's Claims.Tenant) — never from the request body. The handler
+// is responsible for that wiring.
 type TransferInput struct {
+	TenantID       string
 	IdempotencyKey string
 	FromAccountID  uuid.UUID
 	ToAccountID    uuid.UUID

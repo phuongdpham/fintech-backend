@@ -27,13 +27,17 @@ func (s TransactionStatus) Valid() bool {
 // at-most-once semantics even under retry storms.
 type Transaction struct {
 	ID             uuid.UUID
+	TenantID       string
 	IdempotencyKey string
 	Status         TransactionStatus
 	Entries        []JournalEntry
 	CreatedAt      time.Time
 }
 
-func NewTransaction(id uuid.UUID, idemKey string, status TransactionStatus, entries []JournalEntry, createdAt time.Time) (*Transaction, error) {
+func NewTransaction(id uuid.UUID, tenantID, idemKey string, status TransactionStatus, entries []JournalEntry, createdAt time.Time) (*Transaction, error) {
+	if tenantID == "" {
+		return nil, ErrTenantRequired
+	}
 	if idemKey == "" {
 		return nil, ErrDuplicateIdempotencyKey
 	}
@@ -42,6 +46,7 @@ func NewTransaction(id uuid.UUID, idemKey string, status TransactionStatus, entr
 	}
 	return &Transaction{
 		ID:             id,
+		TenantID:       tenantID,
 		IdempotencyKey: idemKey,
 		Status:         status,
 		Entries:        entries,

@@ -46,8 +46,8 @@ func (r *LedgerRepo) WithRetryConfig(cfg RetryConfig) *LedgerRepo {
 
 const (
 	insertTransactionSQL = `
-		INSERT INTO transactions (id, idempotency_key, status, created_at)
-		VALUES ($1, $2, $3, $4)`
+		INSERT INTO transactions (id, tenant_id, idempotency_key, status, created_at)
+		VALUES ($1, $2, $3, $4, $5)`
 
 	insertJournalEntrySQL = `
 		INSERT INTO journal_entries (id, transaction_id, account_id, amount, currency, created_at)
@@ -58,14 +58,14 @@ const (
 		VALUES ($1, $2, $3, $4, $5, $6)`
 
 	selectTransactionSQL = `
-		SELECT id, idempotency_key, status, created_at
+		SELECT id, tenant_id, idempotency_key, status, created_at
 		FROM transactions
 		WHERE id = $1`
 
-	selectTransactionByIdemKeySQL = `
-		SELECT id, idempotency_key, status, created_at
+	selectTransactionByTenantIdemKeySQL = `
+		SELECT id, tenant_id, idempotency_key, status, created_at
 		FROM transactions
-		WHERE idempotency_key = $1`
+		WHERE tenant_id = $1 AND idempotency_key = $2`
 
 	selectJournalEntriesSQL = `
 		SELECT id, transaction_id, account_id, amount, currency, created_at
@@ -120,6 +120,7 @@ func (r *LedgerRepo) ExecuteTransfer(ctx context.Context, req domain.TransferReq
 	}
 	transaction := &domain.Transaction{
 		ID:             txID,
+		TenantID:       req.TenantID,
 		IdempotencyKey: req.IdempotencyKey,
 		Status:         domain.TransactionStatusCommitted,
 		Entries:        []domain.JournalEntry{debitLeg, creditLeg},
@@ -136,7 +137,7 @@ func (r *LedgerRepo) ExecuteTransfer(ctx context.Context, req domain.TransferReq
 
 	err := InTx(ctx, r.pool, r.retry, func(ctx context.Context, tx pgx.Tx) error {
 		if _, err := tx.Exec(ctx, insertTransactionSQL,
-			transaction.ID, transaction.IdempotencyKey,
+			transaction.ID, transaction.TenantID, transaction.IdempotencyKey,
 			string(transaction.Status), transaction.CreatedAt,
 		); err != nil {
 			if IsUniqueViolation(err) {
@@ -178,24 +179,29 @@ func (r *LedgerRepo) GetTransaction(ctx context.Context, id uuid.UUID) (*domain.
 	return r.loadTransaction(ctx, selectTransactionSQL, id)
 }
 
-// GetTransactionByIdempotencyKey is the replay-path read. Returns
-// ErrTransactionNotFound if the key has never been written.
-func (r *LedgerRepo) GetTransactionByIdempotencyKey(ctx context.Context, key string) (*domain.Transaction, error) {
+// GetTransactionByIdempotencyKey is the replay-path read. Tenant scoping
+// is mandatory: composite UNIQUE (tenant_id, idempotency_key) means the
+// same key can legally exist across tenants, and an unscoped query could
+// return another tenant's row. Returns ErrTransactionNotFound if no row.
+func (r *LedgerRepo) GetTransactionByIdempotencyKey(ctx context.Context, tenantID, key string) (*domain.Transaction, error) {
+	if tenantID == "" {
+		return nil, domain.ErrTenantRequired
+	}
 	if key == "" {
 		return nil, fmt.Errorf("repository: idempotency key is required")
 	}
-	return r.loadTransaction(ctx, selectTransactionByIdemKeySQL, key)
+	return r.loadTransaction(ctx, selectTransactionByTenantIdemKeySQL, tenantID, key)
 }
 
 // loadTransaction fetches the transactions row using the supplied SQL +
-// argument, then attaches journal entries. Two pool queries on purpose:
+// arguments, then attaches journal entries. Two pool queries on purpose:
 // keeping legs as a separate query lets us paginate them later without
 // changing the header query shape.
-func (r *LedgerRepo) loadTransaction(ctx context.Context, headerSQL string, arg any) (*domain.Transaction, error) {
+func (r *LedgerRepo) loadTransaction(ctx context.Context, headerSQL string, args ...any) (*domain.Transaction, error) {
 	var t domain.Transaction
 	var statusStr string
-	err := r.pool.QueryRow(ctx, headerSQL, arg).
-		Scan(&t.ID, &t.IdempotencyKey, &statusStr, &t.CreatedAt)
+	err := r.pool.QueryRow(ctx, headerSQL, args...).
+		Scan(&t.ID, &t.TenantID, &t.IdempotencyKey, &statusStr, &t.CreatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, domain.ErrTransactionNotFound
 	}
@@ -225,6 +231,9 @@ func (r *LedgerRepo) loadTransaction(ctx context.Context, headerSQL string, arg 
 }
 
 func (r *LedgerRepo) validateTransferRequest(req domain.TransferRequest) error {
+	if req.TenantID == "" {
+		return domain.ErrTenantRequired
+	}
 	if req.IdempotencyKey == "" {
 		return domain.ErrDuplicateIdempotencyKey
 	}

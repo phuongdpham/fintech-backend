@@ -87,8 +87,12 @@ func (f *fakeLedgerRepo) seed(tx *domain.Transaction) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.txByID[tx.ID] = tx
-	f.txByIdem[tx.IdempotencyKey] = tx
+	f.txByIdem[idemBucketKey(tx.TenantID, tx.IdempotencyKey)] = tx
 }
+
+// idemBucketKey scopes the per-tenant uniqueness lookup. Mirrors the real
+// PG composite UNIQUE (tenant_id, idempotency_key).
+func idemBucketKey(tenantID, key string) string { return tenantID + "|" + key }
 
 func (f *fakeLedgerRepo) ExecuteTransfer(_ context.Context, req domain.TransferRequest) (*domain.Transaction, error) {
 	f.mu.Lock()
@@ -97,13 +101,15 @@ func (f *fakeLedgerRepo) ExecuteTransfer(_ context.Context, req domain.TransferR
 	if f.executeErr != nil {
 		return nil, f.executeErr
 	}
-	if _, exists := f.txByIdem[req.IdempotencyKey]; exists {
+	bucket := idemBucketKey(req.TenantID, req.IdempotencyKey)
+	if _, exists := f.txByIdem[bucket]; exists {
 		return nil, domain.ErrDuplicateIdempotencyKey
 	}
 	now := time.Now().UTC()
 	txID := uuid.New()
 	tx := &domain.Transaction{
 		ID:             txID,
+		TenantID:       req.TenantID,
 		IdempotencyKey: req.IdempotencyKey,
 		Status:         domain.TransactionStatusCommitted,
 		Entries: []domain.JournalEntry{
@@ -117,7 +123,7 @@ func (f *fakeLedgerRepo) ExecuteTransfer(_ context.Context, req domain.TransferR
 		return nil, err
 	}
 	f.txByID[txID] = tx
-	f.txByIdem[req.IdempotencyKey] = tx
+	f.txByIdem[bucket] = tx
 	return tx, nil
 }
 
@@ -131,11 +137,11 @@ func (f *fakeLedgerRepo) GetTransaction(_ context.Context, id uuid.UUID) (*domai
 	return tx, nil
 }
 
-func (f *fakeLedgerRepo) GetTransactionByIdempotencyKey(_ context.Context, key string) (*domain.Transaction, error) {
+func (f *fakeLedgerRepo) GetTransactionByIdempotencyKey(_ context.Context, tenantID, key string) (*domain.Transaction, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.replayLookupCalls++
-	tx, ok := f.txByIdem[key]
+	tx, ok := f.txByIdem[idemBucketKey(tenantID, key)]
 	if !ok {
 		return nil, domain.ErrTransactionNotFound
 	}
@@ -154,6 +160,7 @@ func silentLogger() *slog.Logger {
 
 func validInput() usecase.TransferInput {
 	return usecase.TransferInput{
+		TenantID:       "tenant-a",
 		IdempotencyKey: "k1",
 		FromAccountID:  uuid.MustParse("11111111-1111-1111-1111-111111111111"),
 		ToAccountID:    uuid.MustParse("22222222-2222-2222-2222-222222222222"),
@@ -191,6 +198,7 @@ func TestTransferUsecase_Execute(t *testing.T) {
 				txID := uuid.New()
 				tx := &domain.Transaction{
 					ID:             txID,
+					TenantID:       "tenant-a",
 					IdempotencyKey: "k1",
 					Status:         domain.TransactionStatusCommitted,
 					Entries: []domain.JournalEntry{
@@ -199,7 +207,7 @@ func TestTransferUsecase_Execute(t *testing.T) {
 					},
 				}
 				repo.seed(tx)
-				idem.state["k1"] = domain.IdempotencyCompleted
+				idem.state["tenant-a:k1"] = domain.IdempotencyCompleted
 			},
 			in:                 validInput(),
 			wantReplayed:       true,
@@ -210,7 +218,7 @@ func TestTransferUsecase_Execute(t *testing.T) {
 		{
 			name: "STARTED state -> ErrTransferInFlight, no repo touch",
 			setup: func(_ *testing.T, idem *fakeIdemStore, _ *fakeLedgerRepo) {
-				idem.state["k1"] = domain.IdempotencyStarted
+				idem.state["tenant-a:k1"] = domain.IdempotencyStarted
 			},
 			in:                 validInput(),
 			wantErr:            domain.ErrTransferInFlight,
@@ -220,7 +228,7 @@ func TestTransferUsecase_Execute(t *testing.T) {
 		{
 			name: "FAILED state -> ErrIdempotencyKeyFailed, no repo touch",
 			setup: func(_ *testing.T, idem *fakeIdemStore, _ *fakeLedgerRepo) {
-				idem.state["k1"] = domain.IdempotencyFailed
+				idem.state["tenant-a:k1"] = domain.IdempotencyFailed
 			},
 			in:                 validInput(),
 			wantErr:            domain.ErrIdempotencyKeyFailed,
@@ -253,6 +261,7 @@ func TestTransferUsecase_Execute(t *testing.T) {
 				txID := uuid.New()
 				tx := &domain.Transaction{
 					ID:             txID,
+					TenantID:       "tenant-a",
 					IdempotencyKey: "k1",
 					Status:         domain.TransactionStatusCommitted,
 					Entries: []domain.JournalEntry{
@@ -346,7 +355,7 @@ func TestTransferUsecase_Execute(t *testing.T) {
 			require.Equal(t, tc.wantExecuteCalls, repo.executeCalls, "ExecuteTransfer call count")
 			require.Equal(t, tc.wantReplayLookups, repo.replayLookupCalls, "GetByIdemKey call count")
 			if tc.wantFinalIdemState != "" || tc.wantExecuteCalls > 0 || tc.wantReplayed {
-				require.Equal(t, tc.wantFinalIdemState, idem.get("k1"), "final idempotency state")
+				require.Equal(t, tc.wantFinalIdemState, idem.get("tenant-a:k1"), "final idempotency state")
 			}
 		})
 	}

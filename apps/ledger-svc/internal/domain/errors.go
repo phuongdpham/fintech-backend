@@ -23,6 +23,12 @@ var (
 	ErrAccountNotFound         = errors.New("domain: account not found")
 	ErrTransactionNotFound     = errors.New("domain: transaction not found")
 
+	// ErrTenantRequired is returned when a tenant-scoped operation is
+	// attempted without an authenticated tenant. The handler maps this to
+	// codes.Unauthenticated — never InvalidArgument, since tenant is sourced
+	// from auth claims, never from the request body.
+	ErrTenantRequired = errors.New("domain: tenant is required")
+
 	// ErrTransferInFlight indicates an existing request under the same
 	// idempotency key is still STARTED. Caller should retry after a short
 	// delay; the response will eventually settle to a stored transaction

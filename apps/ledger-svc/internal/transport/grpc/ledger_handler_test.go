@@ -21,9 +21,25 @@ import (
 
 	"github.com/phuongdpham/fintech/apps/ledger-svc/internal/domain"
 	transportgrpc "github.com/phuongdpham/fintech/apps/ledger-svc/internal/transport/grpc"
+	"github.com/phuongdpham/fintech/apps/ledger-svc/internal/transport/grpc/interceptors"
 	"github.com/phuongdpham/fintech/apps/ledger-svc/internal/usecase"
 	pb "github.com/phuongdpham/fintech/libs/go/proto-gen/fintech/ledger/v1"
 )
+
+// testTenant is the synthetic tenant the test harness's auth shim attaches
+// to every request. Mirrors what the real Auth interceptor would do once
+// configured with a Verifier returning Claims.Tenant.
+const testTenant = "tenant-a"
+
+// injectTestClaims is the test-only auth shim. It pre-populates a Claims
+// record with Tenant=testTenant on every incoming request so the handler's
+// tenant-required check sees a valid tenant. Real deployments use
+// interceptors.Auth + a Verifier; this stays out of the test loop because
+// the suite is exercising handler-and-below behavior, not auth.
+func injectTestClaims(ctx context.Context, req any, _ *gogrpc.UnaryServerInfo, handler gogrpc.UnaryHandler) (any, error) {
+	ctx = interceptors.WithClaims(ctx, &interceptors.Claims{Subject: "test-user", Tenant: testTenant})
+	return handler(ctx, req)
+}
 
 // ---------------------------------------------------------------------------
 // In-memory fakes — match the contract of the production ports closely
@@ -68,22 +84,28 @@ func newFakeRepo() *fakeLedgerRepo {
 		txByIdem: map[string]*domain.Transaction{},
 	}
 }
+// idemBucketKey scopes the per-tenant uniqueness lookup. Mirrors the real
+// PG composite UNIQUE (tenant_id, idempotency_key).
+func idemBucketKey(tenantID, key string) string { return tenantID + "|" + key }
+
 func (f *fakeLedgerRepo) seed(tx *domain.Transaction) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.txByID[tx.ID] = tx
-	f.txByIdem[tx.IdempotencyKey] = tx
+	f.txByIdem[idemBucketKey(tx.TenantID, tx.IdempotencyKey)] = tx
 }
 func (f *fakeLedgerRepo) ExecuteTransfer(_ context.Context, req domain.TransferRequest) (*domain.Transaction, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if _, exists := f.txByIdem[req.IdempotencyKey]; exists {
+	bucket := idemBucketKey(req.TenantID, req.IdempotencyKey)
+	if _, exists := f.txByIdem[bucket]; exists {
 		return nil, domain.ErrDuplicateIdempotencyKey
 	}
 	now := time.Now().UTC()
 	txID := uuid.New()
 	tx := &domain.Transaction{
 		ID:             txID,
+		TenantID:       req.TenantID,
 		IdempotencyKey: req.IdempotencyKey,
 		Status:         domain.TransactionStatusCommitted,
 		Entries: []domain.JournalEntry{
@@ -96,7 +118,7 @@ func (f *fakeLedgerRepo) ExecuteTransfer(_ context.Context, req domain.TransferR
 		return nil, err
 	}
 	f.txByID[txID] = tx
-	f.txByIdem[req.IdempotencyKey] = tx
+	f.txByIdem[bucket] = tx
 	return tx, nil
 }
 func (f *fakeLedgerRepo) GetTransaction(_ context.Context, id uuid.UUID) (*domain.Transaction, error) {
@@ -108,10 +130,10 @@ func (f *fakeLedgerRepo) GetTransaction(_ context.Context, id uuid.UUID) (*domai
 	}
 	return tx, nil
 }
-func (f *fakeLedgerRepo) GetTransactionByIdempotencyKey(_ context.Context, key string) (*domain.Transaction, error) {
+func (f *fakeLedgerRepo) GetTransactionByIdempotencyKey(_ context.Context, tenantID, key string) (*domain.Transaction, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	tx, ok := f.txByIdem[key]
+	tx, ok := f.txByIdem[idemBucketKey(tenantID, key)]
 	if !ok {
 		return nil, domain.ErrTransactionNotFound
 	}
@@ -139,7 +161,7 @@ func newHarness(t *testing.T) *harness {
 	handler := transportgrpc.NewLedgerHandler(uc, repo, slog.New(slog.NewTextHandler(io.Discard, nil)))
 
 	lis := bufconn.Listen(bufSize)
-	srv := gogrpc.NewServer()
+	srv := gogrpc.NewServer(gogrpc.UnaryInterceptor(injectTestClaims))
 	pb.RegisterLedgerServiceServer(srv, handler)
 	go func() { _ = srv.Serve(lis) }()
 
@@ -195,6 +217,7 @@ func TestLedgerHandler_Transfer(t *testing.T) {
 				txID := uuid.New()
 				h.repo.seed(&domain.Transaction{
 					ID:             txID,
+					TenantID:       testTenant,
 					IdempotencyKey: "k1",
 					Status:         domain.TransactionStatusCommitted,
 					Entries: []domain.JournalEntry{
@@ -203,7 +226,7 @@ func TestLedgerHandler_Transfer(t *testing.T) {
 					},
 					CreatedAt: now,
 				})
-				h.idem.state["k1"] = domain.IdempotencyCompleted
+				h.idem.state[testTenant+":k1"] = domain.IdempotencyCompleted
 			},
 			wantCode:     codes.OK,
 			wantReplayed: true,
@@ -211,14 +234,14 @@ func TestLedgerHandler_Transfer(t *testing.T) {
 		{
 			name: "STARTED state -> Aborted",
 			setup: func(h *harness) {
-				h.idem.state["k1"] = domain.IdempotencyStarted
+				h.idem.state[testTenant+":k1"] = domain.IdempotencyStarted
 			},
 			wantCode: codes.Aborted,
 		},
 		{
 			name: "FAILED state -> AlreadyExists",
 			setup: func(h *harness) {
-				h.idem.state["k1"] = domain.IdempotencyFailed
+				h.idem.state[testTenant+":k1"] = domain.IdempotencyFailed
 			},
 			wantCode: codes.AlreadyExists,
 		},
@@ -278,6 +301,7 @@ func TestLedgerHandler_GetTransaction(t *testing.T) {
 	txID := uuid.New()
 	h.repo.seed(&domain.Transaction{
 		ID:             txID,
+		TenantID:       testTenant,
 		IdempotencyKey: "seeded",
 		Status:         domain.TransactionStatusCommitted,
 		Entries: []domain.JournalEntry{
@@ -318,6 +342,7 @@ func TestLedgerHandler_Transfer_TrailerOnReplay(t *testing.T) {
 	txID := uuid.New()
 	h.repo.seed(&domain.Transaction{
 		ID:             txID,
+		TenantID:       testTenant,
 		IdempotencyKey: "k1",
 		Status:         domain.TransactionStatusCommitted,
 		Entries: []domain.JournalEntry{
@@ -326,7 +351,7 @@ func TestLedgerHandler_Transfer_TrailerOnReplay(t *testing.T) {
 		},
 		CreatedAt: now,
 	})
-	h.idem.state["k1"] = domain.IdempotencyCompleted
+	h.idem.state[testTenant+":k1"] = domain.IdempotencyCompleted
 
 	var trailer metadata.MD
 	resp, err := h.client.Transfer(context.Background(), validTransferReq(), gogrpc.Trailer(&trailer))

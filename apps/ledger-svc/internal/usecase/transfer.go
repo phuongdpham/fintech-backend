@@ -74,14 +74,17 @@ func (u *TransferUsecase) Execute(ctx context.Context, in TransferInput) (*Trans
 		return nil, err
 	}
 
-	// (3) Redis idempotency fast-path.
-	acquired, state, err := u.idem.Acquire(ctx, in.IdempotencyKey)
+	// (3) Redis idempotency fast-path. Key is tenant-scoped so two tenants
+	// can legally use the same caller-supplied string without colliding.
+	scopedKey := scopedIdempotencyKey(in.TenantID, in.IdempotencyKey)
+	acquired, state, err := u.idem.Acquire(ctx, scopedKey)
 	if err != nil {
 		// Fail-open: Redis fault must not block writes. PG's UNIQUE
-		// constraint on transactions.idempotency_key is the durable
+		// constraint on (tenant_id, idempotency_key) is the durable
 		// barrier; the outbox is unaffected. Log and proceed.
 		u.log.WarnContext(ctx, "redis idempotency unavailable; falling through to Postgres",
 			slog.String("idempotency_key", in.IdempotencyKey),
+			slog.String("tenant_id", in.TenantID),
 			slog.Any("err", err))
 		return u.executeAndReplayOnDup(ctx, in)
 	}
@@ -89,7 +92,7 @@ func (u *TransferUsecase) Execute(ctx context.Context, in TransferInput) (*Trans
 	if !acquired {
 		switch state {
 		case domain.IdempotencyCompleted:
-			return u.replay(ctx, in.IdempotencyKey)
+			return u.replay(ctx, in.TenantID, in.IdempotencyKey)
 		case domain.IdempotencyStarted:
 			return nil, domain.ErrTransferInFlight
 		case domain.IdempotencyFailed:
@@ -108,24 +111,33 @@ func (u *TransferUsecase) Execute(ctx context.Context, in TransferInput) (*Trans
 	if err != nil {
 		// (5b) Best-effort failure-state write. Do not surface SetState
 		// errors — the original error is what the caller needs to see.
-		if setErr := u.idem.SetState(ctx, in.IdempotencyKey, domain.IdempotencyFailed); setErr != nil {
+		if setErr := u.idem.SetState(ctx, scopedKey, domain.IdempotencyFailed); setErr != nil {
 			u.log.WarnContext(ctx, "failed to mark idempotency state FAILED",
 				slog.String("idempotency_key", in.IdempotencyKey),
+				slog.String("tenant_id", in.TenantID),
 				slog.Any("err", setErr))
 		}
 		return nil, err
 	}
 
 	// (5a) Mark COMPLETED so subsequent retries hit the replay path.
-	if setErr := u.idem.SetState(ctx, in.IdempotencyKey, domain.IdempotencyCompleted); setErr != nil {
+	if setErr := u.idem.SetState(ctx, scopedKey, domain.IdempotencyCompleted); setErr != nil {
 		u.log.WarnContext(ctx, "failed to mark idempotency state COMPLETED",
 			slog.String("idempotency_key", in.IdempotencyKey),
+			slog.String("tenant_id", in.TenantID),
 			slog.Any("err", setErr))
 		// Intentionally do NOT fail the request. The PG write succeeded;
 		// future replays will fall through to PG's UNIQUE constraint and
 		// recover via the executeAndReplayOnDup path.
 	}
 	return out, nil
+}
+
+// scopedIdempotencyKey builds the opaque key handed to the Redis store.
+// Format: "<tenant>:<key>". The store stays oblivious to tenants; tenant
+// isolation lives at the call site so there's exactly one place to audit.
+func scopedIdempotencyKey(tenantID, key string) string {
+	return tenantID + ":" + key
 }
 
 // executeAndReplayOnDup is the path that's safe to call whether or not
@@ -137,6 +149,7 @@ func (u *TransferUsecase) executeAndReplayOnDup(ctx context.Context, in Transfer
 		return nil, err
 	}
 	req := domain.TransferRequest{
+		TenantID:       in.TenantID,
 		IdempotencyKey: in.IdempotencyKey,
 		FromAccountID:  in.FromAccountID,
 		ToAccountID:    in.ToAccountID,
@@ -149,13 +162,13 @@ func (u *TransferUsecase) executeAndReplayOnDup(ctx context.Context, in Transfer
 		return &TransferOutput{Transaction: tx, Replayed: false}, nil
 	}
 	if errors.Is(err, domain.ErrDuplicateIdempotencyKey) {
-		return u.replay(ctx, in.IdempotencyKey)
+		return u.replay(ctx, in.TenantID, in.IdempotencyKey)
 	}
 	return nil, err
 }
 
-func (u *TransferUsecase) replay(ctx context.Context, key string) (*TransferOutput, error) {
-	tx, err := u.ledger.GetTransactionByIdempotencyKey(ctx, key)
+func (u *TransferUsecase) replay(ctx context.Context, tenantID, key string) (*TransferOutput, error) {
+	tx, err := u.ledger.GetTransactionByIdempotencyKey(ctx, tenantID, key)
 	if err != nil {
 		// Inconsistency: idempotency state says COMPLETED (or PG UNIQUE
 		// said duplicate) but the row isn't there. Surface as an error
@@ -167,6 +180,7 @@ func (u *TransferUsecase) replay(ctx context.Context, key string) (*TransferOutp
 
 func buildPreflightTransaction(in TransferInput) *domain.Transaction {
 	return &domain.Transaction{
+		TenantID:       in.TenantID,
 		IdempotencyKey: in.IdempotencyKey,
 		Status:         domain.TransactionStatusCommitted,
 		Entries: []domain.JournalEntry{
@@ -184,9 +198,20 @@ func buildPreflightTransaction(in TransferInput) *domain.Transaction {
 	}
 }
 
+// idempotencyKeyMaxLen caps caller-supplied keys at 64 bytes. The plan's
+// canonical shape is a UUID (36 chars) or short opaque token; 64 leaves
+// headroom without exposing Redis / PG to a megabyte-key DoS.
+const idempotencyKeyMaxLen = 64
+
 func validateTransferInput(in TransferInput) error {
+	if in.TenantID == "" {
+		return domain.ErrTenantRequired
+	}
 	if in.IdempotencyKey == "" {
 		return fmt.Errorf("usecase: idempotency_key is required")
+	}
+	if len(in.IdempotencyKey) > idempotencyKeyMaxLen {
+		return fmt.Errorf("usecase: idempotency_key exceeds %d bytes", idempotencyKeyMaxLen)
 	}
 	if !in.Currency.Valid() {
 		return domain.ErrInvalidCurrency

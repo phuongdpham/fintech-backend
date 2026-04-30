@@ -23,6 +23,7 @@ type AccountRepository interface {
 // event, and commit — all atomically. SQLSTATE 40001 retries are the
 // caller's concern (see Phase 4).
 type TransferRequest struct {
+	TenantID       string
 	IdempotencyKey string
 	FromAccountID  uuid.UUID
 	ToAccountID    uuid.UUID
@@ -37,11 +38,14 @@ type TransferRequest struct {
 // GetTransactionByIdempotencyKey exists for the replay path: when a duplicate
 // idempotency key is detected (Redis says COMPLETED, or PG UNIQUE caught a
 // late duplicate), the usecase loads the original transaction and returns
-// it to the caller verbatim. Returns ErrTransactionNotFound if no row.
+// it to the caller verbatim. Tenant scoping is mandatory — the composite
+// UNIQUE (tenant_id, idempotency_key) means the same key string can legally
+// exist across tenants, and the replay must filter by tenant or risk
+// returning another tenant's row. Returns ErrTransactionNotFound if no row.
 type LedgerRepository interface {
 	ExecuteTransfer(ctx context.Context, req TransferRequest) (*Transaction, error)
 	GetTransaction(ctx context.Context, id uuid.UUID) (*Transaction, error)
-	GetTransactionByIdempotencyKey(ctx context.Context, key string) (*Transaction, error)
+	GetTransactionByIdempotencyKey(ctx context.Context, tenantID, key string) (*Transaction, error)
 }
 
 // OutboxRepository is the persistence port driven by the Outbox Relay.
