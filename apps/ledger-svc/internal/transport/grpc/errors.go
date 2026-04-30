@@ -38,6 +38,7 @@ var errorMapping = []struct {
 	{domain.ErrDuplicateIdempotencyKey, codes.AlreadyExists},
 	{domain.ErrTenantRequired, codes.Unauthenticated},
 	{domain.ErrAccountTenantMismatch, codes.PermissionDenied},
+	{domain.ErrRequestFingerprintMismatch, codes.FailedPrecondition},
 }
 
 // asGRPCError translates a domain or wrapped error to a gRPC status error.

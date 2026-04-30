@@ -25,46 +25,54 @@ import (
 
 type fakeIdemStore struct {
 	mu          sync.Mutex
-	state       map[string]domain.IdempotencyState
+	records     map[string]domain.IdempotencyRecord
 	acquireErr  error
 	setStateErr error
-	// forceRace makes Acquire return (false, "", nil) — the SETNX-fail
+	// forceRace makes Acquire return (false, zero, nil) — the SETNX-fail
 	// + GET-returns-nil race documented in the Redis adapter.
 	forceRace bool
 }
 
-func newFakeIdem() *fakeIdemStore { return &fakeIdemStore{state: map[string]domain.IdempotencyState{}} }
+func newFakeIdem() *fakeIdemStore {
+	return &fakeIdemStore{records: map[string]domain.IdempotencyRecord{}}
+}
 
-func (f *fakeIdemStore) Acquire(_ context.Context, key string) (bool, domain.IdempotencyState, error) {
+func (f *fakeIdemStore) Acquire(_ context.Context, key, fingerprint string) (bool, domain.IdempotencyRecord, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.acquireErr != nil {
-		return false, "", f.acquireErr
+		return false, domain.IdempotencyRecord{}, f.acquireErr
 	}
 	if f.forceRace {
-		return false, "", nil
+		return false, domain.IdempotencyRecord{}, nil
 	}
-	if cur, ok := f.state[key]; ok {
+	if cur, ok := f.records[key]; ok {
 		return false, cur, nil
 	}
-	f.state[key] = domain.IdempotencyStarted
-	return true, "", nil
+	f.records[key] = domain.IdempotencyRecord{State: domain.IdempotencyStarted, Fingerprint: fingerprint}
+	return true, domain.IdempotencyRecord{}, nil
 }
 
-func (f *fakeIdemStore) SetState(_ context.Context, key string, s domain.IdempotencyState) error {
+func (f *fakeIdemStore) SetState(_ context.Context, key, fingerprint string, s domain.IdempotencyState) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.setStateErr != nil {
 		return f.setStateErr
 	}
-	f.state[key] = s
+	f.records[key] = domain.IdempotencyRecord{State: s, Fingerprint: fingerprint}
 	return nil
 }
 
-func (f *fakeIdemStore) get(key string) domain.IdempotencyState {
+func (f *fakeIdemStore) getState(key string) domain.IdempotencyState {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.state[key]
+	return f.records[key].State
+}
+
+func (f *fakeIdemStore) seedRecord(key string, rec domain.IdempotencyRecord) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.records[key] = rec
 }
 
 type fakeLedgerRepo struct {
@@ -108,10 +116,11 @@ func (f *fakeLedgerRepo) ExecuteTransfer(_ context.Context, req domain.TransferR
 	now := time.Now().UTC()
 	txID := uuid.New()
 	tx := &domain.Transaction{
-		ID:             txID,
-		TenantID:       req.TenantID,
-		IdempotencyKey: req.IdempotencyKey,
-		Status:         domain.TransactionStatusCommitted,
+		ID:                 txID,
+		TenantID:           req.TenantID,
+		IdempotencyKey:     req.IdempotencyKey,
+		RequestFingerprint: req.RequestFingerprint,
+		Status:             domain.TransactionStatusCommitted,
 		Entries: []domain.JournalEntry{
 			{ID: uuid.New(), TransactionID: txID, AccountID: req.FromAccountID, Amount: req.Amount.Neg(), Currency: req.Currency, CreatedAt: now},
 			{ID: uuid.New(), TransactionID: txID, AccountID: req.ToAccountID, Amount: req.Amount, Currency: req.Currency, CreatedAt: now},
@@ -195,19 +204,23 @@ func TestTransferUsecase_Execute(t *testing.T) {
 		{
 			name: "replay: Redis says COMPLETED -> load existing tx, do not re-execute",
 			setup: func(_ *testing.T, idem *fakeIdemStore, repo *fakeLedgerRepo) {
+				fp := usecase.TransferFingerprint(validInput())
 				txID := uuid.New()
 				tx := &domain.Transaction{
-					ID:             txID,
-					TenantID:       "tenant-a",
-					IdempotencyKey: "k1",
-					Status:         domain.TransactionStatusCommitted,
+					ID:                 txID,
+					TenantID:           "tenant-a",
+					IdempotencyKey:     "k1",
+					RequestFingerprint: fp,
+					Status:             domain.TransactionStatusCommitted,
 					Entries: []domain.JournalEntry{
 						{ID: uuid.New(), TransactionID: txID, Amount: decimal.NewFromInt(-100), Currency: "USD"},
 						{ID: uuid.New(), TransactionID: txID, Amount: decimal.NewFromInt(100), Currency: "USD"},
 					},
 				}
 				repo.seed(tx)
-				idem.state["tenant-a:k1"] = domain.IdempotencyCompleted
+				idem.seedRecord("tenant-a:k1", domain.IdempotencyRecord{
+					State: domain.IdempotencyCompleted, Fingerprint: fp,
+				})
 			},
 			in:                 validInput(),
 			wantReplayed:       true,
@@ -218,7 +231,10 @@ func TestTransferUsecase_Execute(t *testing.T) {
 		{
 			name: "STARTED state -> ErrTransferInFlight, no repo touch",
 			setup: func(_ *testing.T, idem *fakeIdemStore, _ *fakeLedgerRepo) {
-				idem.state["tenant-a:k1"] = domain.IdempotencyStarted
+				fp := usecase.TransferFingerprint(validInput())
+				idem.seedRecord("tenant-a:k1", domain.IdempotencyRecord{
+					State: domain.IdempotencyStarted, Fingerprint: fp,
+				})
 			},
 			in:                 validInput(),
 			wantErr:            domain.ErrTransferInFlight,
@@ -228,12 +244,39 @@ func TestTransferUsecase_Execute(t *testing.T) {
 		{
 			name: "FAILED state -> ErrIdempotencyKeyFailed, no repo touch",
 			setup: func(_ *testing.T, idem *fakeIdemStore, _ *fakeLedgerRepo) {
-				idem.state["tenant-a:k1"] = domain.IdempotencyFailed
+				fp := usecase.TransferFingerprint(validInput())
+				idem.seedRecord("tenant-a:k1", domain.IdempotencyRecord{
+					State: domain.IdempotencyFailed, Fingerprint: fp,
+				})
 			},
 			in:                 validInput(),
 			wantErr:            domain.ErrIdempotencyKeyFailed,
 			wantExecuteCalls:   0,
 			wantFinalIdemState: domain.IdempotencyFailed,
+		},
+		{
+			name: "fingerprint mismatch on completed slot -> ErrRequestFingerprintMismatch",
+			setup: func(_ *testing.T, idem *fakeIdemStore, _ *fakeLedgerRepo) {
+				idem.seedRecord("tenant-a:k1", domain.IdempotencyRecord{
+					State: domain.IdempotencyCompleted, Fingerprint: "deadbeef-prior-request-fp",
+				})
+			},
+			in:                 validInput(),
+			wantErr:            domain.ErrRequestFingerprintMismatch,
+			wantExecuteCalls:   0,
+			wantFinalIdemState: domain.IdempotencyCompleted, // unchanged
+		},
+		{
+			name: "fingerprint mismatch on in-flight slot -> ErrRequestFingerprintMismatch",
+			setup: func(_ *testing.T, idem *fakeIdemStore, _ *fakeLedgerRepo) {
+				idem.seedRecord("tenant-a:k1", domain.IdempotencyRecord{
+					State: domain.IdempotencyStarted, Fingerprint: "deadbeef-prior-request-fp",
+				})
+			},
+			in:                 validInput(),
+			wantErr:            domain.ErrRequestFingerprintMismatch,
+			wantExecuteCalls:   0,
+			wantFinalIdemState: domain.IdempotencyStarted, // unchanged
 		},
 		{
 			name: "Redis race (SETNX fail + TTL expired) falls through to PG; PG writes new tx",
@@ -355,7 +398,7 @@ func TestTransferUsecase_Execute(t *testing.T) {
 			require.Equal(t, tc.wantExecuteCalls, repo.executeCalls, "ExecuteTransfer call count")
 			require.Equal(t, tc.wantReplayLookups, repo.replayLookupCalls, "GetByIdemKey call count")
 			if tc.wantFinalIdemState != "" || tc.wantExecuteCalls > 0 || tc.wantReplayed {
-				require.Equal(t, tc.wantFinalIdemState, idem.get("tenant-a:k1"), "final idempotency state")
+				require.Equal(t, tc.wantFinalIdemState, idem.getState("tenant-a:k1"), "final idempotency state")
 			}
 		})
 	}

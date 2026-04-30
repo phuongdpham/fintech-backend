@@ -26,15 +26,16 @@ func (s TransactionStatus) Valid() bool {
 // IdempotencyKey is the user-supplied key the system uses to guarantee
 // at-most-once semantics even under retry storms.
 type Transaction struct {
-	ID             uuid.UUID
-	TenantID       string
-	IdempotencyKey string
-	Status         TransactionStatus
-	Entries        []JournalEntry
-	CreatedAt      time.Time
+	ID                 uuid.UUID
+	TenantID           string
+	IdempotencyKey     string
+	RequestFingerprint string
+	Status             TransactionStatus
+	Entries            []JournalEntry
+	CreatedAt          time.Time
 }
 
-func NewTransaction(id uuid.UUID, tenantID, idemKey string, status TransactionStatus, entries []JournalEntry, createdAt time.Time) (*Transaction, error) {
+func NewTransaction(id uuid.UUID, tenantID, idemKey, fingerprint string, status TransactionStatus, entries []JournalEntry, createdAt time.Time) (*Transaction, error) {
 	if tenantID == "" {
 		return nil, ErrTenantRequired
 	}
@@ -45,12 +46,13 @@ func NewTransaction(id uuid.UUID, tenantID, idemKey string, status TransactionSt
 		return nil, ErrInvalidTxStatus
 	}
 	return &Transaction{
-		ID:             id,
-		TenantID:       tenantID,
-		IdempotencyKey: idemKey,
-		Status:         status,
-		Entries:        entries,
-		CreatedAt:      createdAt,
+		ID:                 id,
+		TenantID:           tenantID,
+		IdempotencyKey:     idemKey,
+		RequestFingerprint: fingerprint,
+		Status:             status,
+		Entries:            entries,
+		CreatedAt:          createdAt,
 	}, nil
 }
 

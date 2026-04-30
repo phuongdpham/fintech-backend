@@ -49,26 +49,26 @@ func injectTestClaims(ctx context.Context, req any, _ *gogrpc.UnaryServerInfo, h
 // ---------------------------------------------------------------------------
 
 type fakeIdemStore struct {
-	mu    sync.Mutex
-	state map[string]domain.IdempotencyState
+	mu      sync.Mutex
+	records map[string]domain.IdempotencyRecord
 }
 
 func newFakeIdem() *fakeIdemStore {
-	return &fakeIdemStore{state: map[string]domain.IdempotencyState{}}
+	return &fakeIdemStore{records: map[string]domain.IdempotencyRecord{}}
 }
-func (f *fakeIdemStore) Acquire(_ context.Context, key string) (bool, domain.IdempotencyState, error) {
+func (f *fakeIdemStore) Acquire(_ context.Context, key, fingerprint string) (bool, domain.IdempotencyRecord, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if cur, ok := f.state[key]; ok {
+	if cur, ok := f.records[key]; ok {
 		return false, cur, nil
 	}
-	f.state[key] = domain.IdempotencyStarted
-	return true, "", nil
+	f.records[key] = domain.IdempotencyRecord{State: domain.IdempotencyStarted, Fingerprint: fingerprint}
+	return true, domain.IdempotencyRecord{}, nil
 }
-func (f *fakeIdemStore) SetState(_ context.Context, key string, s domain.IdempotencyState) error {
+func (f *fakeIdemStore) SetState(_ context.Context, key, fingerprint string, s domain.IdempotencyState) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.state[key] = s
+	f.records[key] = domain.IdempotencyRecord{State: s, Fingerprint: fingerprint}
 	return nil
 }
 
@@ -104,10 +104,11 @@ func (f *fakeLedgerRepo) ExecuteTransfer(_ context.Context, req domain.TransferR
 	now := time.Now().UTC()
 	txID := uuid.New()
 	tx := &domain.Transaction{
-		ID:             txID,
-		TenantID:       req.TenantID,
-		IdempotencyKey: req.IdempotencyKey,
-		Status:         domain.TransactionStatusCommitted,
+		ID:                 txID,
+		TenantID:           req.TenantID,
+		IdempotencyKey:     req.IdempotencyKey,
+		RequestFingerprint: req.RequestFingerprint,
+		Status:             domain.TransactionStatusCommitted,
 		Entries: []domain.JournalEntry{
 			{ID: uuid.New(), TransactionID: txID, AccountID: req.FromAccountID, Amount: req.Amount.Neg(), Currency: req.Currency, CreatedAt: now},
 			{ID: uuid.New(), TransactionID: txID, AccountID: req.ToAccountID, Amount: req.Amount, Currency: req.Currency, CreatedAt: now},
@@ -194,6 +195,22 @@ func validTransferReq() *pb.TransferRequest {
 	}
 }
 
+// validTransferFingerprint returns the canonical fingerprint of the
+// validTransferReq() body as the production handler would compute it
+// (after parsing the proto). Test setups use this to seed the fake
+// idempotency store with a fingerprint that matches the request the
+// test will send — otherwise the mismatch path fires.
+func validTransferFingerprint() string {
+	return usecase.TransferFingerprint(usecase.TransferInput{
+		TenantID:       testTenant,
+		IdempotencyKey: "k1",
+		FromAccountID:  uuid.MustParse("11111111-1111-1111-1111-111111111111"),
+		ToAccountID:    uuid.MustParse("22222222-2222-2222-2222-222222222222"),
+		Amount:         decimal.NewFromFloat(100.0),
+		Currency:       "USD",
+	})
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -213,20 +230,24 @@ func TestLedgerHandler_Transfer(t *testing.T) {
 		{
 			name: "replay path returns OK with replayed=true",
 			setup: func(h *harness) {
+				fp := validTransferFingerprint()
 				now := time.Now().UTC()
 				txID := uuid.New()
 				h.repo.seed(&domain.Transaction{
-					ID:             txID,
-					TenantID:       testTenant,
-					IdempotencyKey: "k1",
-					Status:         domain.TransactionStatusCommitted,
+					ID:                 txID,
+					TenantID:           testTenant,
+					IdempotencyKey:     "k1",
+					RequestFingerprint: fp,
+					Status:             domain.TransactionStatusCommitted,
 					Entries: []domain.JournalEntry{
 						{ID: uuid.New(), TransactionID: txID, Amount: decimal.NewFromInt(-100), Currency: "USD", CreatedAt: now},
 						{ID: uuid.New(), TransactionID: txID, Amount: decimal.NewFromInt(100), Currency: "USD", CreatedAt: now},
 					},
 					CreatedAt: now,
 				})
-				h.idem.state[testTenant+":k1"] = domain.IdempotencyCompleted
+				h.idem.records[testTenant+":k1"] = domain.IdempotencyRecord{
+					State: domain.IdempotencyCompleted, Fingerprint: fp,
+				}
 			},
 			wantCode:     codes.OK,
 			wantReplayed: true,
@@ -234,16 +255,29 @@ func TestLedgerHandler_Transfer(t *testing.T) {
 		{
 			name: "STARTED state -> Aborted",
 			setup: func(h *harness) {
-				h.idem.state[testTenant+":k1"] = domain.IdempotencyStarted
+				h.idem.records[testTenant+":k1"] = domain.IdempotencyRecord{
+					State: domain.IdempotencyStarted, Fingerprint: validTransferFingerprint(),
+				}
 			},
 			wantCode: codes.Aborted,
 		},
 		{
 			name: "FAILED state -> AlreadyExists",
 			setup: func(h *harness) {
-				h.idem.state[testTenant+":k1"] = domain.IdempotencyFailed
+				h.idem.records[testTenant+":k1"] = domain.IdempotencyRecord{
+					State: domain.IdempotencyFailed, Fingerprint: validTransferFingerprint(),
+				}
 			},
 			wantCode: codes.AlreadyExists,
+		},
+		{
+			name: "fingerprint mismatch on completed -> FailedPrecondition",
+			setup: func(h *harness) {
+				h.idem.records[testTenant+":k1"] = domain.IdempotencyRecord{
+					State: domain.IdempotencyCompleted, Fingerprint: "stale-prior-request-fp",
+				}
+			},
+			wantCode: codes.FailedPrecondition,
 		},
 		{
 			name:     "invalid from_account_id -> InvalidArgument",
@@ -338,20 +372,24 @@ func TestLedgerHandler_Transfer_TrailerOnReplay(t *testing.T) {
 	h := newHarness(t)
 	defer h.stop()
 
+	fp := validTransferFingerprint()
 	now := time.Now().UTC()
 	txID := uuid.New()
 	h.repo.seed(&domain.Transaction{
-		ID:             txID,
-		TenantID:       testTenant,
-		IdempotencyKey: "k1",
-		Status:         domain.TransactionStatusCommitted,
+		ID:                 txID,
+		TenantID:           testTenant,
+		IdempotencyKey:     "k1",
+		RequestFingerprint: fp,
+		Status:             domain.TransactionStatusCommitted,
 		Entries: []domain.JournalEntry{
 			{ID: uuid.New(), TransactionID: txID, Amount: decimal.NewFromInt(-100), Currency: "USD", CreatedAt: now},
 			{ID: uuid.New(), TransactionID: txID, Amount: decimal.NewFromInt(100), Currency: "USD", CreatedAt: now},
 		},
 		CreatedAt: now,
 	})
-	h.idem.state[testTenant+":k1"] = domain.IdempotencyCompleted
+	h.idem.records[testTenant+":k1"] = domain.IdempotencyRecord{
+		State: domain.IdempotencyCompleted, Fingerprint: fp,
+	}
 
 	var trailer metadata.MD
 	resp, err := h.client.Transfer(context.Background(), validTransferReq(), gogrpc.Trailer(&trailer))

@@ -46,8 +46,8 @@ func (r *LedgerRepo) WithRetryConfig(cfg RetryConfig) *LedgerRepo {
 
 const (
 	insertTransactionSQL = `
-		INSERT INTO transactions (id, tenant_id, idempotency_key, status, created_at)
-		VALUES ($1, $2, $3, $4, $5)`
+		INSERT INTO transactions (id, tenant_id, idempotency_key, request_fingerprint, status, created_at)
+		VALUES ($1, $2, $3, $4, $5, $6)`
 
 	insertJournalEntrySQL = `
 		INSERT INTO journal_entries (id, transaction_id, tenant_id, account_id, amount, currency, created_at)
@@ -58,12 +58,12 @@ const (
 		VALUES ($1, $2, $3, $4, $5, $6)`
 
 	selectTransactionSQL = `
-		SELECT id, tenant_id, idempotency_key, status, created_at
+		SELECT id, tenant_id, idempotency_key, request_fingerprint, status, created_at
 		FROM transactions
 		WHERE id = $1`
 
 	selectTransactionByTenantIdemKeySQL = `
-		SELECT id, tenant_id, idempotency_key, status, created_at
+		SELECT id, tenant_id, idempotency_key, request_fingerprint, status, created_at
 		FROM transactions
 		WHERE tenant_id = $1 AND idempotency_key = $2`
 
@@ -121,12 +121,13 @@ func (r *LedgerRepo) ExecuteTransfer(ctx context.Context, req domain.TransferReq
 		CreatedAt:     now,
 	}
 	transaction := &domain.Transaction{
-		ID:             txID,
-		TenantID:       req.TenantID,
-		IdempotencyKey: req.IdempotencyKey,
-		Status:         domain.TransactionStatusCommitted,
-		Entries:        []domain.JournalEntry{debitLeg, creditLeg},
-		CreatedAt:      now,
+		ID:                 txID,
+		TenantID:           req.TenantID,
+		IdempotencyKey:     req.IdempotencyKey,
+		RequestFingerprint: req.RequestFingerprint,
+		Status:             domain.TransactionStatusCommitted,
+		Entries:            []domain.JournalEntry{debitLeg, creditLeg},
+		CreatedAt:          now,
 	}
 
 	// Defense-in-depth: balance check BEFORE going to the DB. Costs one
@@ -140,6 +141,7 @@ func (r *LedgerRepo) ExecuteTransfer(ctx context.Context, req domain.TransferReq
 	err := InTx(ctx, r.pool, r.retry, func(ctx context.Context, tx pgx.Tx) error {
 		if _, err := tx.Exec(ctx, insertTransactionSQL,
 			transaction.ID, transaction.TenantID, transaction.IdempotencyKey,
+			transaction.RequestFingerprint,
 			string(transaction.Status), transaction.CreatedAt,
 		); err != nil {
 			if IsUniqueViolation(err) {
@@ -209,7 +211,7 @@ func (r *LedgerRepo) loadTransaction(ctx context.Context, headerSQL string, args
 	var t domain.Transaction
 	var statusStr string
 	err := r.pool.QueryRow(ctx, headerSQL, args...).
-		Scan(&t.ID, &t.TenantID, &t.IdempotencyKey, &statusStr, &t.CreatedAt)
+		Scan(&t.ID, &t.TenantID, &t.IdempotencyKey, &t.RequestFingerprint, &statusStr, &t.CreatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, domain.ErrTransactionNotFound
 	}
@@ -244,6 +246,9 @@ func (r *LedgerRepo) validateTransferRequest(req domain.TransferRequest) error {
 	}
 	if req.IdempotencyKey == "" {
 		return domain.ErrDuplicateIdempotencyKey
+	}
+	if req.RequestFingerprint == "" {
+		return fmt.Errorf("repository: request_fingerprint is required")
 	}
 	if !req.Currency.Valid() {
 		return domain.ErrInvalidCurrency

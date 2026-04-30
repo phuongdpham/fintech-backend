@@ -9,6 +9,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -72,53 +73,73 @@ func (s *RedisIdempotencyStore) WithTTLs(startedTTL, terminalTTL time.Duration) 
 
 func (s *RedisIdempotencyStore) key(k string) string { return s.prefix + k }
 
-// Acquire attempts an atomic SETNX with TTL.
+// recordSep separates the state and fingerprint inside the Redis value.
+// State strings are fixed-vocabulary (STARTED|COMPLETED|FAILED) and the
+// fingerprint is hex (no ':'), so a single split is unambiguous.
+const recordSep = ":"
+
+func encodeRecord(rec domain.IdempotencyRecord) string {
+	return string(rec.State) + recordSep + rec.Fingerprint
+}
+
+func decodeRecord(raw string) domain.IdempotencyRecord {
+	state, fp, ok := strings.Cut(raw, recordSep)
+	if !ok {
+		// Legacy value (state-only). Treat fingerprint as empty so the
+		// usecase falls through to PG, which remains the source of truth.
+		return domain.IdempotencyRecord{State: domain.IdempotencyState(raw)}
+	}
+	return domain.IdempotencyRecord{
+		State:       domain.IdempotencyState(state),
+		Fingerprint: fp,
+	}
+}
+
+// Acquire attempts an atomic SETNX with the given fingerprint.
 //
 // Contract:
 //
-//	(true,  "",        nil)  caller owns the slot; proceed
-//	(false, currState, nil)  duplicate; honor the existing in-flight or
-//	                         completed request (caller looks up Postgres
-//	                         to return the original response)
-//	(false, "",        nil)  race: SETNX failed but TTL expired before GET.
+//	(true,  zero,      nil)  caller owns the slot; proceed
+//	(false, existing,  nil)  duplicate; caller compares fingerprints and
+//	                         either replays (match) or rejects with
+//	                         ErrRequestFingerprintMismatch (no match)
+//	(false, zero,      nil)  race: SETNX failed but TTL expired before GET.
 //	                         Conservative reading is "duplicate". Caller
-//	                         falls through to Postgres which is the source
-//	                         of truth.
-//	(false, "",        err)  Redis fault. Caller decides: fail-closed (reject
-//	                         the request) or fail-open (let Postgres' UNIQUE
-//	                         constraint catch duplicates). The plan's
-//	                         architecture favors fail-open here because PG
-//	                         remains durable, but the policy lives in the
-//	                         usecase, not here.
-func (s *RedisIdempotencyStore) Acquire(ctx context.Context, key string) (bool, domain.IdempotencyState, error) {
+//	                         falls through to Postgres.
+//	(false, zero,      err)  Redis fault. Caller fails open to PG; the
+//	                         composite UNIQUE plus the durable
+//	                         request_fingerprint column catch duplicates
+//	                         and mismatched bodies respectively.
+func (s *RedisIdempotencyStore) Acquire(ctx context.Context, key, fingerprint string) (bool, domain.IdempotencyRecord, error) {
 	if key == "" {
-		return false, "", fmt.Errorf("redis idempotency: key is required")
+		return false, domain.IdempotencyRecord{}, fmt.Errorf("redis idempotency: key is required")
 	}
-	ok, err := s.client.SetNX(ctx, s.key(key), string(domain.IdempotencyStarted), s.startedTTL).Result()
+	value := encodeRecord(domain.IdempotencyRecord{
+		State:       domain.IdempotencyStarted,
+		Fingerprint: fingerprint,
+	})
+	ok, err := s.client.SetNX(ctx, s.key(key), value, s.startedTTL).Result()
 	if err != nil {
-		return false, "", fmt.Errorf("redis idempotency: SETNX: %w", err)
+		return false, domain.IdempotencyRecord{}, fmt.Errorf("redis idempotency: SETNX: %w", err)
 	}
 	if ok {
-		return true, "", nil
+		return true, domain.IdempotencyRecord{}, nil
 	}
 	cur, err := s.client.Get(ctx, s.key(key)).Result()
 	if errors.Is(err, redis.Nil) {
-		// TTL expired between SETNX and GET. Stay conservative: report
-		// duplicate-with-no-state and let the caller resolve via Postgres.
-		return false, "", nil
+		return false, domain.IdempotencyRecord{}, nil
 	}
 	if err != nil {
-		return false, "", fmt.Errorf("redis idempotency: GET: %w", err)
+		return false, domain.IdempotencyRecord{}, fmt.Errorf("redis idempotency: GET: %w", err)
 	}
-	state := domain.IdempotencyState(cur)
-	return false, state, nil
+	return false, decodeRecord(cur), nil
 }
 
-// SetState writes the new state. STARTED reuses the short startedTTL;
-// terminal states (COMPLETED, FAILED) refresh to the long terminalTTL,
-// keeping the duplicate-detection window open for the full 24h on
-// settled flows.
-func (s *RedisIdempotencyStore) SetState(ctx context.Context, key string, state domain.IdempotencyState) error {
+// SetState writes the new state preserving the fingerprint. STARTED reuses
+// the short startedTTL; terminal states (COMPLETED, FAILED) refresh to the
+// long terminalTTL, keeping the duplicate-detection window open for the
+// full 24h on settled flows.
+func (s *RedisIdempotencyStore) SetState(ctx context.Context, key, fingerprint string, state domain.IdempotencyState) error {
 	if key == "" {
 		return fmt.Errorf("redis idempotency: key is required")
 	}
@@ -131,7 +152,8 @@ func (s *RedisIdempotencyStore) SetState(ctx context.Context, key string, state 
 	default:
 		return fmt.Errorf("redis idempotency: invalid state %q", state)
 	}
-	if err := s.client.Set(ctx, s.key(key), string(state), ttl).Err(); err != nil {
+	value := encodeRecord(domain.IdempotencyRecord{State: state, Fingerprint: fingerprint})
+	if err := s.client.Set(ctx, s.key(key), value, ttl).Err(); err != nil {
 		return fmt.Errorf("redis idempotency: SET state: %w", err)
 	}
 	return nil

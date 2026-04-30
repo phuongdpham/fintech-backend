@@ -37,6 +37,14 @@ var (
 	// to touch a resource they don't own.
 	ErrAccountTenantMismatch = errors.New("domain: account does not belong to tenant")
 
+	// ErrRequestFingerprintMismatch is returned when a request reuses an
+	// idempotency_key with a different payload than the original. Either
+	// the client has a bug (regenerated key but kept the body, or vice
+	// versa) or the request was tampered with in flight. Caller MUST
+	// mint a new key — the original transaction stands. Maps to
+	// codes.FailedPrecondition.
+	ErrRequestFingerprintMismatch = errors.New("domain: idempotency key reused with different request payload")
+
 	// ErrTransferInFlight indicates an existing request under the same
 	// idempotency key is still STARTED. Caller should retry after a short
 	// delay; the response will eventually settle to a stored transaction
