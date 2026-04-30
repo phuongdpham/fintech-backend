@@ -15,8 +15,24 @@ import (
 
 	"github.com/phuongdpham/fintech/apps/ledger-svc/internal/domain"
 	"github.com/phuongdpham/fintech/apps/ledger-svc/internal/domain/mocks"
+	"github.com/phuongdpham/fintech/apps/ledger-svc/internal/transport/grpc/interceptors"
 	"github.com/phuongdpham/fintech/apps/ledger-svc/internal/usecase"
 )
+
+// envelopeCtx returns a context populated as the production interceptor
+// chain would: Claims (tenant + actor) and request_id. The audit
+// envelope extractor needs both — calling Execute with a bare context
+// is a wiring bug the usecase deliberately fails loud on.
+func envelopeCtx(t *testing.T) context.Context {
+	t.Helper()
+	ctx := t.Context()
+	ctx = interceptors.WithClaims(ctx, &interceptors.Claims{
+		Subject: "test-user",
+		Tenant:  "tenant-a",
+	})
+	ctx = interceptors.WithRequestID(ctx, "test-request-id")
+	return ctx
+}
 
 // silentLogger discards usecase warnings during tests so failure signal
 // only comes from assertions.
@@ -281,7 +297,7 @@ func TestTransferUsecase_Execute(t *testing.T) {
 			}
 			uc := usecase.NewTransferUsecase(repo, idem, silentLogger())
 
-			out, err := uc.Execute(t.Context(), tc.in)
+			out, err := uc.Execute(envelopeCtx(t), tc.in)
 
 			switch {
 			case tc.wantErr != nil:
@@ -327,7 +343,7 @@ func TestTransferUsecase_Execute_PreflightBalanceHolds(t *testing.T) {
 		Return(nil)
 
 	uc := usecase.NewTransferUsecase(repo, idem, silentLogger())
-	out, err := uc.Execute(t.Context(), in)
+	out, err := uc.Execute(envelopeCtx(t), in)
 	require.NoError(t, err)
 	require.NotNil(t, out)
 	require.Len(t, out.Transaction.Entries, 2)

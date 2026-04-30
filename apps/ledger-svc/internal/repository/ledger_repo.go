@@ -174,6 +174,25 @@ func (r *LedgerRepo) ExecuteTransfer(ctx context.Context, req domain.TransferReq
 			return fmt.Errorf("insert outbox event: %w", err)
 		}
 
+		// Audit row — tamper-evident chain link, committed in the same
+		// tx so the ledger write is atomic with its own audit. Failure
+		// here rolls back the ledger write rather than leaving an
+		// un-audited transaction on disk.
+		auditBody, err := canonicalTransactionAudit(transaction)
+		if err != nil {
+			return fmt.Errorf("audit: canonicalize transaction: %w", err)
+		}
+		if err := writeAuditEvent(ctx, tx, domain.AuditEvent{
+			AuditEnvelope: req.AuditEnvelope,
+			AggregateType: domain.AuditAggregateTransaction,
+			AggregateID:   transaction.ID,
+			Operation:     domain.AuditOpTransferExecuted,
+			BeforeState:   nil, // INSERT — no prior state
+			AfterState:    auditBody,
+		}); err != nil {
+			return err
+		}
+
 		return nil
 	})
 	if err != nil {

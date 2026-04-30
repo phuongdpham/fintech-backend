@@ -33,6 +33,11 @@ type TransferRequest struct {
 	Amount             Amount
 	Currency           Currency
 	OutboxPayload      []byte
+	// AuditEnvelope is sourced from request context (Claims, RequestID,
+	// trace_id) by the usecase. The repo writes the audit row in the
+	// same Postgres tx as the ledger write — committed-or-not-at-all.
+	// Required: empty TenantID/ActorSubject/RequestID hard-fails the call.
+	AuditEnvelope AuditEnvelope
 }
 
 // LedgerRepository owns the atomic write path for balanced transactions.

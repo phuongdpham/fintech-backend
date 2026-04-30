@@ -10,6 +10,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/phuongdpham/fintech/apps/ledger-svc/internal/audit"
 	"github.com/phuongdpham/fintech/apps/ledger-svc/internal/domain"
 )
 
@@ -180,6 +181,13 @@ func (u *TransferUsecase) executeAndReplayOnDup(ctx context.Context, in Transfer
 	if err != nil {
 		return nil, err
 	}
+	envelope, err := audit.EnvelopeFromContext(ctx)
+	if err != nil {
+		// Wiring bug: by the time we reach the usecase, EdgeIdentity
+		// has populated Claims and RequestID. An empty envelope means
+		// a misconfigured interceptor chain — fail loud, not silent.
+		return nil, fmt.Errorf("usecase: %w", err)
+	}
 	req := domain.TransferRequest{
 		TenantID:           in.TenantID,
 		IdempotencyKey:     in.IdempotencyKey,
@@ -189,6 +197,7 @@ func (u *TransferUsecase) executeAndReplayOnDup(ctx context.Context, in Transfer
 		Amount:             in.Amount,
 		Currency:           in.Currency,
 		OutboxPayload:      payload,
+		AuditEnvelope:      envelope,
 	}
 	tx, err := u.ledger.ExecuteTransfer(ctx, req)
 	if err == nil {

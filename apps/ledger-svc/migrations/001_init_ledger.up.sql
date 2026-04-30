@@ -109,3 +109,71 @@ CREATE INDEX idx_journal_account ON journal_entries (account_id);
 -- in arrival order". Keeping it partial keeps the index tiny and writes cheap.
 CREATE INDEX idx_outbox_pending  ON outbox_events  (created_at)
     WHERE status = 'PENDING';
+
+-- ----------------------------------------------------------------------------
+-- Audit log
+--
+-- Every state-changing operation (transfer execution, future account/freeze
+-- ops) appends one row here, in the SAME Postgres transaction as the ledger
+-- write. Three guarantees this layer enforces:
+--
+--   * Tamper evidence — entry_hash chains backward via prev_hash
+--     (per-tenant chain anchored at all-zeros GenesisHash).
+--   * Atomic with ledger — committed-or-not-at-all with the underlying
+--     state change. If the audit write fails, the ledger write rolls back.
+--   * Append-only intent — production deployments revoke UPDATE/DELETE on
+--     this table from the app role. The hash chain catches any in-flight
+--     tampering even if a privileged role mutates rows.
+--
+-- Range-partitioned by month from day one. Adding partitioning to a non-
+-- empty table later is painful; greenfield is the only cheap window.
+-- A monthly partition manager (pg_cron / external) creates next-month's
+-- partition before it's needed; this migration seeds the first six
+-- partitions to bootstrap.
+--
+-- Per-tenant chain integrity: an audit gap in tenant A doesn't invalidate
+-- tenant B's chain. The hot read path on every audit write is
+-- "give me the latest entry_hash for tenant X", indexed below.
+-- ----------------------------------------------------------------------------
+
+CREATE TABLE audit_log (
+    id              UUID            NOT NULL DEFAULT uuidv7(),
+    occurred_at     TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
+    tenant_id       VARCHAR(128)    NOT NULL,
+    actor_subject   VARCHAR(255)    NOT NULL,
+    actor_session   VARCHAR(255)    NOT NULL DEFAULT '',
+    request_id      VARCHAR(64)     NOT NULL,
+    trace_id        VARCHAR(32)     NOT NULL DEFAULT '',
+    aggregate_type  VARCHAR(50)     NOT NULL,
+    aggregate_id    UUID            NOT NULL,
+    operation       VARCHAR(80)     NOT NULL,
+    before_state    JSONB,
+    after_state     JSONB,
+    prev_hash       BYTEA           NOT NULL,
+    entry_hash      BYTEA           NOT NULL,
+    -- Partition key MUST be in the primary key for declarative partitioning.
+    PRIMARY KEY (id, occurred_at)
+) PARTITION BY RANGE (occurred_at);
+
+-- Hot read path: "latest entry_hash for tenant X" on every audit write.
+-- DESC order matches the lookup direction; (occurred_at, id) breaks ties
+-- deterministically when two rows share the same nanosecond.
+CREATE INDEX idx_audit_tenant_chain
+    ON audit_log (tenant_id, occurred_at DESC, id DESC);
+
+-- Common audit query patterns. Add more as they materialize.
+CREATE INDEX idx_audit_aggregate
+    ON audit_log (tenant_id, aggregate_type, aggregate_id, occurred_at);
+CREATE INDEX idx_audit_actor
+    ON audit_log (tenant_id, actor_subject, occurred_at);
+
+-- Bootstrap partitions: current month + five ahead. Production needs a
+-- partition manager to keep rolling; running short of partitions hard-
+-- fails INSERTs (no default partition by design — silent fallback to a
+-- catch-all partition would defeat the audit-row time guarantees).
+CREATE TABLE audit_log_y2026m05 PARTITION OF audit_log FOR VALUES FROM ('2026-05-01') TO ('2026-06-01');
+CREATE TABLE audit_log_y2026m06 PARTITION OF audit_log FOR VALUES FROM ('2026-06-01') TO ('2026-07-01');
+CREATE TABLE audit_log_y2026m07 PARTITION OF audit_log FOR VALUES FROM ('2026-07-01') TO ('2026-08-01');
+CREATE TABLE audit_log_y2026m08 PARTITION OF audit_log FOR VALUES FROM ('2026-08-01') TO ('2026-09-01');
+CREATE TABLE audit_log_y2026m09 PARTITION OF audit_log FOR VALUES FROM ('2026-09-01') TO ('2026-10-01');
+CREATE TABLE audit_log_y2026m10 PARTITION OF audit_log FOR VALUES FROM ('2026-10-01') TO ('2026-11-01');

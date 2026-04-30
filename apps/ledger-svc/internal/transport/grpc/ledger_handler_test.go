@@ -35,12 +35,14 @@ const (
 	testToAccount   = "22222222-2222-2222-2222-222222222222"
 )
 
-// injectTestClaims is the test-only auth shim. The real EdgeIdentity
-// interceptor wants x-tenant-id / x-actor-subject headers; this short-
-// circuits straight to a populated Claims so the suite focuses on
-// handler-and-below behavior.
+// injectTestClaims is the test-only shim that mimics the production
+// interceptor chain (EdgeIdentity + RequestID). Both are required for
+// audit.EnvelopeFromContext to succeed downstream — short-circuiting
+// claims without a request_id leaves the envelope incomplete and every
+// usecase call hard-fails.
 func injectTestClaims(ctx context.Context, req any, _ *gogrpc.UnaryServerInfo, handler gogrpc.UnaryHandler) (any, error) {
 	ctx = interceptors.WithClaims(ctx, &interceptors.Claims{Subject: "test-user", Tenant: testTenant})
+	ctx = interceptors.WithRequestID(ctx, "test-request-id")
 	return handler(ctx, req)
 }
 
