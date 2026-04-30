@@ -201,125 +201,86 @@ func TestRecovery(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Auth
+// EdgeIdentity
 // ---------------------------------------------------------------------------
 
-type fakeVerifier struct {
-	wantToken string
-	claims    *interceptors.Claims
-	err       error
-}
-
-func (f *fakeVerifier) Verify(_ context.Context, token string) (*interceptors.Claims, error) {
-	if f.err != nil {
-		return nil, f.err
-	}
-	if token != f.wantToken {
-		return nil, interceptors.ErrInvalidToken
-	}
-	return f.claims, nil
-}
-
-func TestAuth(t *testing.T) {
+func TestEdgeIdentity(t *testing.T) {
 	publicSet := map[string]struct{}{
 		"/grpc.health.v1.Health/Check": {},
 	}
-	devClaims := &interceptors.Claims{Subject: "alice", Scopes: []string{"ledger.transfer"}}
 
 	cases := []struct {
-		name           string
-		cfg            interceptors.AuthConfig
-		method         string
-		incomingMD     metadata.MD
-		wantCode       codes.Code
-		wantClaims     *interceptors.Claims
+		name       string
+		cfg        interceptors.EdgeIdentityConfig
+		method     string
+		incomingMD metadata.MD
+		wantCode   codes.Code
+		wantClaims *interceptors.Claims
 	}{
 		{
-			name: "public method bypasses auth even when required",
-			cfg: interceptors.AuthConfig{
-				Required:      true,
-				Verifier:      &fakeVerifier{wantToken: "good"},
-				PublicMethods: publicSet,
-			},
+			name:     "public method bypasses identity check",
+			cfg:      interceptors.EdgeIdentityConfig{PublicMethods: publicSet},
 			method:   "/grpc.health.v1.Health/Check",
 			wantCode: codes.OK,
 		},
 		{
-			name:     "required + missing token -> Unauthenticated",
-			cfg:      interceptors.AuthConfig{Required: true, Verifier: &fakeVerifier{}, PublicMethods: publicSet},
+			name:     "missing all headers -> Unauthenticated",
+			cfg:      interceptors.EdgeIdentityConfig{PublicMethods: publicSet},
 			method:   "/svc/M",
 			wantCode: codes.Unauthenticated,
 		},
 		{
-			name: "required + bad token -> Unauthenticated",
-			cfg: interceptors.AuthConfig{
-				Required:      true,
-				Verifier:      &fakeVerifier{wantToken: "good"},
-				PublicMethods: publicSet,
-			},
-			method:     "/svc/M",
-			incomingMD: metadata.Pairs("authorization", "Bearer wrong"),
-			wantCode:   codes.Unauthenticated,
+			name:   "missing tenant -> Unauthenticated",
+			cfg:    interceptors.EdgeIdentityConfig{PublicMethods: publicSet},
+			method: "/svc/M",
+			incomingMD: metadata.Pairs(
+				interceptors.HeaderActorSubject, "alice",
+			),
+			wantCode: codes.Unauthenticated,
 		},
 		{
-			name: "required + good token -> OK + claims injected",
-			cfg: interceptors.AuthConfig{
-				Required:      true,
-				Verifier:      &fakeVerifier{wantToken: "good", claims: devClaims},
-				PublicMethods: publicSet,
-			},
-			method:     "/svc/M",
-			incomingMD: metadata.Pairs("authorization", "Bearer good"),
+			name:   "missing subject -> Unauthenticated",
+			cfg:    interceptors.EdgeIdentityConfig{PublicMethods: publicSet},
+			method: "/svc/M",
+			incomingMD: metadata.Pairs(
+				interceptors.HeaderTenantID, "tenant-a",
+			),
+			wantCode: codes.Unauthenticated,
+		},
+		{
+			name:   "empty tenant string -> Unauthenticated",
+			cfg:    interceptors.EdgeIdentityConfig{PublicMethods: publicSet},
+			method: "/svc/M",
+			incomingMD: metadata.Pairs(
+				interceptors.HeaderTenantID, "",
+				interceptors.HeaderActorSubject, "alice",
+			),
+			wantCode: codes.Unauthenticated,
+		},
+		{
+			name:   "tenant + subject present -> OK with claims",
+			cfg:    interceptors.EdgeIdentityConfig{PublicMethods: publicSet},
+			method: "/svc/M",
+			incomingMD: metadata.Pairs(
+				interceptors.HeaderTenantID, "tenant-a",
+				interceptors.HeaderActorSubject, "alice",
+			),
 			wantCode:   codes.OK,
-			wantClaims: devClaims,
+			wantClaims: &interceptors.Claims{Subject: "alice", Tenant: "tenant-a"},
 		},
 		{
-			name:       "required + verifier returns network error -> Internal",
-			cfg:        interceptors.AuthConfig{Required: true, Verifier: &fakeVerifier{err: errors.New("jwks down")}, PublicMethods: publicSet},
-			method:     "/svc/M",
-			incomingMD: metadata.Pairs("authorization", "Bearer x"),
-			wantCode:   codes.Internal,
-		},
-		{
-			name:     "best-effort + no token -> proceeds with nil claims",
-			cfg:      interceptors.AuthConfig{Required: false, PublicMethods: publicSet},
-			method:   "/svc/M",
+			name:   "tenant + subject + session -> session populated",
+			cfg:    interceptors.EdgeIdentityConfig{PublicMethods: publicSet},
+			method: "/svc/M",
+			incomingMD: metadata.Pairs(
+				interceptors.HeaderTenantID, "tenant-a",
+				interceptors.HeaderActorSubject, "alice",
+				interceptors.HeaderActorSession, "sess-42",
+			),
 			wantCode: codes.OK,
-		},
-		{
-			name: "best-effort + good token -> claims populated",
-			cfg: interceptors.AuthConfig{
-				Required:      false,
-				Verifier:      &fakeVerifier{wantToken: "good", claims: devClaims},
-				PublicMethods: publicSet,
+			wantClaims: &interceptors.Claims{
+				Subject: "alice", Tenant: "tenant-a", Session: "sess-42",
 			},
-			method:     "/svc/M",
-			incomingMD: metadata.Pairs("authorization", "Bearer good"),
-			wantCode:   codes.OK,
-			wantClaims: devClaims,
-		},
-		{
-			name: "best-effort + bad token -> proceeds with nil claims (does not block)",
-			cfg: interceptors.AuthConfig{
-				Required:      false,
-				Verifier:      &fakeVerifier{wantToken: "good"},
-				PublicMethods: publicSet,
-			},
-			method:     "/svc/M",
-			incomingMD: metadata.Pairs("authorization", "Bearer wrong"),
-			wantCode:   codes.Unauthenticated, // Verifier returned ErrInvalidToken; mapped to Unauthenticated
-		},
-		{
-			name: "case-insensitive scheme: bearer (lowercase) accepted",
-			cfg: interceptors.AuthConfig{
-				Required:      true,
-				Verifier:      &fakeVerifier{wantToken: "good", claims: devClaims},
-				PublicMethods: publicSet,
-			},
-			method:     "/svc/M",
-			incomingMD: metadata.Pairs("authorization", "bearer good"),
-			wantCode:   codes.OK,
-			wantClaims: devClaims,
 		},
 	}
 	for _, tc := range cases {
@@ -331,7 +292,7 @@ func TestAuth(t *testing.T) {
 			var captured context.Context
 			handler := captureCtx(&captured)
 
-			_, err := interceptors.Auth(tc.cfg)(ctx, nil, mkInfo(tc.method), handler)
+			_, err := interceptors.EdgeIdentity(tc.cfg)(ctx, nil, mkInfo(tc.method), handler)
 
 			if tc.wantCode == codes.OK {
 				require.NoError(t, err)
@@ -341,6 +302,8 @@ func TestAuth(t *testing.T) {
 				} else {
 					require.NotNil(t, gotClaims)
 					require.Equal(t, tc.wantClaims.Subject, gotClaims.Subject)
+					require.Equal(t, tc.wantClaims.Tenant, gotClaims.Tenant)
+					require.Equal(t, tc.wantClaims.Session, gotClaims.Session)
 				}
 			} else {
 				require.Error(t, err)
@@ -349,32 +312,4 @@ func TestAuth(t *testing.T) {
 			}
 		})
 	}
-}
-
-func TestDevTokenVerifier(t *testing.T) {
-	v := &interceptors.DevTokenVerifier{
-		Token:  "secret",
-		Claims: interceptors.Claims{Subject: "dev"},
-	}
-	c, err := v.Verify(context.Background(), "secret")
-	require.NoError(t, err)
-	require.Equal(t, "dev", c.Subject)
-	require.Equal(t, "secret", c.Raw)
-
-	_, err = v.Verify(context.Background(), "wrong")
-	require.ErrorIs(t, err, interceptors.ErrInvalidToken)
-}
-
-func TestRejectAllVerifier(t *testing.T) {
-	_, err := interceptors.RejectAllVerifier().Verify(context.Background(), "anything")
-	require.ErrorIs(t, err, interceptors.ErrInvalidToken)
-}
-
-func TestClaims_HasScope(t *testing.T) {
-	c := &interceptors.Claims{Scopes: []string{"a", "b"}}
-	require.True(t, c.HasScope("a"))
-	require.True(t, c.HasScope("b"))
-	require.False(t, c.HasScope("c"))
-	var nilClaims *interceptors.Claims
-	require.False(t, nilClaims.HasScope("a"))
 }

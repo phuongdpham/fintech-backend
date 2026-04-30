@@ -2,9 +2,7 @@ package interceptors
 
 import (
 	"context"
-	"errors"
 	"log/slog"
-	"strings"
 
 	gogrpc "google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -12,99 +10,75 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-// Claims is the auth payload propagated through the request context.
-// Kept transport-agnostic so non-gRPC entrypoints (cron, queue workers)
-// could populate it via WithClaims and reuse downstream authorization
-// code.
+// Claims is the per-request actor identity propagated through context.
+// In this architecture the BFF is the trust boundary: it validates the
+// caller's JWT, looks up tenancy, and forwards the resolved identity to
+// internal services as plain headers. ledger-svc does not validate
+// tokens — it trusts the headers because BFF is the only thing that
+// reaches it (network policy / mTLS at deploy time enforces that).
+//
+// Authorization (which scopes a caller has) lives at the BFF too. If
+// BFF lets the request through, ledger-svc executes it.
 type Claims struct {
+	// Subject is the authenticated principal (typically a user UUID or
+	// JWT sub claim). Required.
 	Subject string
-	Email   string
-	Tenant  string
-	Scopes  []string
-	// Raw is the original token string for downstream propagation
-	// (e.g. forwarding to another service). Empty if not relevant.
-	Raw string
+	// Tenant scopes every domain operation. Required.
+	Tenant string
+	// Session is the BFF-issued session identifier. Empty when the
+	// caller is not in a session-bearing flow (e.g. M2M).
+	Session string
 }
 
-// HasScope reports whether the claims include the named scope.
-// Linear scan because scope sets are small (< 20).
-func (c *Claims) HasScope(s string) bool {
-	if c == nil {
-		return false
-	}
-	for _, x := range c.Scopes {
-		if x == s {
-			return true
-		}
-	}
-	return false
-}
+// Header keys for the BFF → ledger-svc identity protocol. Lower-case
+// per gRPC metadata convention.
+const (
+	HeaderTenantID      = "x-tenant-id"
+	HeaderActorSubject  = "x-actor-subject"
+	HeaderActorSession  = "x-actor-session"
+)
 
 type ctxKeyClaims struct{}
 
-// ClaimsFromContext returns the request's auth claims, or nil if the
-// request didn't go through Auth (e.g. public method) or auth was
-// disabled in this deployment. Handler code MUST nil-check.
+// ClaimsFromContext returns the actor claims installed by EdgeIdentity,
+// or nil for public methods that bypass the interceptor. Handler code
+// MUST nil-check.
 func ClaimsFromContext(ctx context.Context) *Claims {
 	c, _ := ctx.Value(ctxKeyClaims{}).(*Claims)
 	return c
 }
 
-// WithClaims is exported for tests and the (rare) handler that needs to
-// override claims (e.g. impersonation).
+// WithClaims is exposed for tests and the rare handler that needs to
+// override claims (e.g. impersonation flows).
 func WithClaims(ctx context.Context, c *Claims) context.Context {
 	return context.WithValue(ctx, ctxKeyClaims{}, c)
 }
 
-// Verifier validates a bearer token and extracts claims. Implementations
-// will typically front a JWKS endpoint (JWT) or an OAuth2 introspection
-// endpoint. The interface is small so swapping is a one-line change.
-//
-// Verifier MUST be safe for concurrent use.
-type Verifier interface {
-	Verify(ctx context.Context, token string) (*Claims, error)
-}
-
-// ErrInvalidToken is the canonical error a Verifier returns when the
-// supplied token is syntactically valid but rejected (bad signature,
-// expired, wrong issuer, etc.). The interceptor maps this to
-// codes.Unauthenticated; other Verifier errors map to codes.Internal
-// because they likely indicate a JWKS / network problem.
-var ErrInvalidToken = errors.New("auth: invalid token")
-
-// AuthConfig configures the Auth interceptor.
-//
-// Required:
-//   true  — every non-public method requires a valid token; missing or
-//           bad token → Unauthenticated.
-//   false — token presence is optional; if present and verifiable, claims
-//           are populated; if absent or invalid, the request still
-//           proceeds with nil claims. Use only in dev / behind a trusted
-//           edge proxy that already authenticates.
+// EdgeIdentityConfig configures the trusted-edge interceptor.
 //
 // PublicMethods is the bypass list (full method names like
 // "/grpc.health.v1.Health/Check"). Empty map = nothing public.
-type AuthConfig struct {
-	Verifier      Verifier
-	Required      bool
+type EdgeIdentityConfig struct {
 	PublicMethods map[string]struct{}
 }
 
 // DefaultPublicMethods covers the standard infra RPCs that should never
-// require auth: health checks (k8s probes / load balancers) and gRPC
-// reflection (developer tooling like grpcurl).
+// require an actor identity: health checks (k8s probes / load balancers)
+// and gRPC reflection (developer tooling like grpcurl).
 func DefaultPublicMethods() map[string]struct{} {
 	return map[string]struct{}{
-		"/grpc.health.v1.Health/Check":                                 {},
-		"/grpc.health.v1.Health/Watch":                                 {},
-		"/grpc.reflection.v1.ServerReflection/ServerReflectionInfo":    {},
+		"/grpc.health.v1.Health/Check":                                   {},
+		"/grpc.health.v1.Health/Watch":                                   {},
+		"/grpc.reflection.v1.ServerReflection/ServerReflectionInfo":      {},
 		"/grpc.reflection.v1alpha.ServerReflection/ServerReflectionInfo": {},
 	}
 }
 
-// Auth is the unary interceptor that gates non-public methods on a valid
-// bearer token. See AuthConfig for the required-vs-best-effort policy.
-func Auth(cfg AuthConfig) gogrpc.UnaryServerInterceptor {
+// EdgeIdentity is the unary interceptor that extracts the BFF-supplied
+// actor headers and installs them on context. Missing required headers
+// produce Unauthenticated; an empty tenant or subject is treated the
+// same as a missing header to defend against BFF bugs.
+func EdgeIdentity(cfg EdgeIdentityConfig) gogrpc.UnaryServerInterceptor {
 	public := cfg.PublicMethods
 	if public == nil {
 		public = map[string]struct{}{}
@@ -114,90 +88,37 @@ func Auth(cfg AuthConfig) gogrpc.UnaryServerInterceptor {
 			return handler(ctx, req)
 		}
 
-		token, ok := bearerFromContext(ctx)
+		md, ok := metadata.FromIncomingContext(ctx)
 		if !ok {
-			if cfg.Required {
-				return nil, status.Error(codes.Unauthenticated, "missing bearer token")
-			}
-			return handler(ctx, req)
+			return nil, status.Error(codes.Unauthenticated, "missing edge identity headers")
 		}
+		tenant := firstHeader(md, HeaderTenantID)
+		subject := firstHeader(md, HeaderActorSubject)
+		if tenant == "" || subject == "" {
+			return nil, status.Error(codes.Unauthenticated, "missing edge identity headers")
+		}
+		c := &Claims{
+			Subject: subject,
+			Tenant:  tenant,
+			Session: firstHeader(md, HeaderActorSession),
+		}
+		ctx = WithClaims(ctx, c)
 
-		if cfg.Verifier == nil {
-			if cfg.Required {
-				return nil, status.Error(codes.Internal, "auth required but no verifier configured")
-			}
-			return handler(ctx, req)
-		}
-
-		claims, err := cfg.Verifier.Verify(ctx, token)
-		if err != nil {
-			if errors.Is(err, ErrInvalidToken) {
-				return nil, status.Error(codes.Unauthenticated, "invalid token")
-			}
-			// Unexpected verifier error (network, JWKS down). Fail closed
-			// when Required, fail open otherwise.
-			if cfg.Required {
-				LoggerFromContext(ctx).ErrorContext(ctx, "auth verifier error",
-					slog.String("rpc.method", info.FullMethod),
-					slog.Any("err", err))
-				return nil, status.Error(codes.Internal, "auth verifier unavailable")
-			}
-			return handler(ctx, req)
-		}
-		ctx = WithClaims(ctx, claims)
-
-		// Enrich the per-call logger so subsequent log lines include subject.
-		if claims != nil && claims.Subject != "" {
-			ctx = WithLogger(ctx, LoggerFromContext(ctx).With("auth.sub", claims.Subject))
-		}
+		// Enrich the per-call logger so subsequent log lines include the
+		// actor + tenant. Cheap; pays back the first time someone greps.
+		ctx = WithLogger(ctx, LoggerFromContext(ctx).With(
+			slog.String("auth.sub", c.Subject),
+			slog.String("auth.tenant", c.Tenant),
+		))
 
 		return handler(ctx, req)
 	}
 }
 
-func bearerFromContext(ctx context.Context) (string, bool) {
-	md, ok := metadata.FromIncomingContext(ctx)
-	if !ok {
-		return "", false
+func firstHeader(md metadata.MD, key string) string {
+	v := md.Get(key)
+	if len(v) == 0 {
+		return ""
 	}
-	for _, h := range md.Get("authorization") {
-		const prefix = "Bearer "
-		if len(h) > len(prefix) && strings.EqualFold(h[:len(prefix)], prefix) {
-			return strings.TrimSpace(h[len(prefix):]), true
-		}
-	}
-	return "", false
+	return v[0]
 }
-
-// ---------------------------------------------------------------------------
-// Verifier implementations
-// ---------------------------------------------------------------------------
-
-// DevTokenVerifier accepts a single hardcoded bearer token for local
-// development and CI. NEVER use in production — the token is compared as
-// a plain string (no signature, no expiry).
-type DevTokenVerifier struct {
-	Token  string
-	Claims Claims
-}
-
-func (v *DevTokenVerifier) Verify(_ context.Context, token string) (*Claims, error) {
-	if v == nil || v.Token == "" || token != v.Token {
-		return nil, ErrInvalidToken
-	}
-	c := v.Claims
-	c.Raw = token
-	return &c, nil
-}
-
-// rejectAllVerifier is used as the default when AuthConfig.Required=true
-// but no Verifier is supplied — fail-closed in production wiring.
-type rejectAllVerifier struct{}
-
-func (rejectAllVerifier) Verify(context.Context, string) (*Claims, error) {
-	return nil, ErrInvalidToken
-}
-
-// RejectAllVerifier returns a Verifier that rejects every token. Used as
-// a deliberate "auth required but real verifier not yet wired" placeholder.
-func RejectAllVerifier() Verifier { return rejectAllVerifier{} }

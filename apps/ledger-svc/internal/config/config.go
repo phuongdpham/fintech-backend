@@ -41,7 +41,6 @@ type Config struct {
 	Redis  RedisConfig
 	Kafka  KafkaConfig
 	Outbox OutboxConfig
-	Auth   AuthConfig
 	OTel   OTelConfig
 }
 
@@ -84,13 +83,6 @@ func (k KafkaConfig) BootstrapServers() string {
 type OutboxConfig struct {
 	Topic   string `env:"OUTBOX_TOPIC"   envDefault:"fintech.ledger.transactions"`
 	Workers int    `env:"OUTBOX_WORKERS" envDefault:"4"`
-}
-
-// AuthConfig — bearer token policy. DevToken is intentionally a static
-// string for local/CI; prod swaps the verifier for JWKS-backed JWT.
-type AuthConfig struct {
-	Required bool   `env:"AUTH_REQUIRED"  envDefault:"false"`
-	DevToken string `env:"AUTH_DEV_TOKEN"`
 }
 
 // OTelConfig — OpenTelemetry knobs. Zero-valued Endpoint installs the
@@ -144,14 +136,6 @@ func Load(opts LoadOptions) (*Config, error) {
 func (c *Config) Validate() error {
 	var errs []error
 
-	if c.Auth.Required && c.Auth.DevToken == "" {
-		// Until JWKS lands, AUTH_REQUIRED=true with no token wires
-		// RejectAllVerifier — every RPC fails. That's a deliberate
-		// policy choice but we'd rather flag it at boot than discover
-		// it via a 100% Unauthenticated rate.
-		errs = append(errs, errors.New(
-			"AUTH_REQUIRED=true but no AUTH_DEV_TOKEN set: every RPC will return Unauthenticated"))
-	}
 	if c.Outbox.Workers < 1 {
 		errs = append(errs, fmt.Errorf("OUTBOX_WORKERS must be >= 1 (got %d)", c.Outbox.Workers))
 	}

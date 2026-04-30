@@ -94,15 +94,17 @@ run-reconciler: $(RECON_BIN)  ## Run the reconciler daemon (foreground)
 .PHONY: smoke
 smoke:  ## Print example grpcurl invocations
 	@printf '%s\n' \
-		'# health check (no auth required)' \
+		'# health check (public; no identity headers needed)' \
 		'grpcurl -plaintext localhost:9090 grpc.health.v1.Health/Check' \
 		'' \
 		'# list services (reflection)' \
 		'grpcurl -plaintext localhost:9090 list' \
 		'' \
-		'# transfer (best-effort auth: token optional)' \
+		'# transfer — direct callers (e.g. dev grpcurl) must mint the headers' \
+		'# the BFF would forward in production: x-tenant-id, x-actor-subject.' \
 		'grpcurl -plaintext \' \
-		'  -H "authorization: Bearer $${AUTH_DEV_TOKEN:-dev-token-change-me}" \' \
+		'  -H "x-tenant-id: tenant-dev" \' \
+		'  -H "x-actor-subject: dev-user" \' \
 		'  -d @ localhost:9090 fintech.ledger.v1.LedgerService/Transfer <<EOF' \
 		'{' \
 		'  "idempotency_key": "smoke-$$(date +%s)",' \

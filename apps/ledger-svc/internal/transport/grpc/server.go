@@ -25,7 +25,7 @@ type ServerConfig struct {
 	Addr           string        // host:port the gRPC server binds
 	MaxRecvMsgSize int           // default 4MiB; override for large bulk RPCs
 	KeepaliveTime  time.Duration // server-side ping every N (default 30s)
-	Auth           interceptors.AuthConfig
+	EdgeIdentity   interceptors.EdgeIdentityConfig
 }
 
 func defaultServerConfig() ServerConfig {
@@ -78,16 +78,17 @@ func New(cfg ServerConfig, handler pb.LedgerServiceServer, log *slog.Logger) (*S
 	// Interceptor chain — order matters. Recovery is outer-most so a panic
 	// in any interceptor below still produces a clean Internal status.
 	// RequestID then Logging give downstream interceptors + the handler a
-	// stable correlation id and a per-call slog.Logger via context. Auth
-	// runs last before the handler so it can log via the per-call logger.
-	if cfg.Auth.PublicMethods == nil {
-		cfg.Auth.PublicMethods = interceptors.DefaultPublicMethods()
+	// stable correlation id and a per-call slog.Logger via context.
+	// EdgeIdentity runs last before the handler so it can log via the
+	// per-call logger.
+	if cfg.EdgeIdentity.PublicMethods == nil {
+		cfg.EdgeIdentity.PublicMethods = interceptors.DefaultPublicMethods()
 	}
 	chain := gogrpc.ChainUnaryInterceptor(
 		interceptors.Recovery(log),
 		interceptors.RequestID(),
 		interceptors.Logging(log),
-		interceptors.Auth(cfg.Auth),
+		interceptors.EdgeIdentity(cfg.EdgeIdentity),
 	)
 
 	srv := gogrpc.NewServer(

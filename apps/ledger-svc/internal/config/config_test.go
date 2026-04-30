@@ -20,7 +20,6 @@ func clearAll(t *testing.T) {
 		"REDIS_URL",
 		"KAFKA_BROKERS", "KAFKA_CLIENT_ID",
 		"OUTBOX_TOPIC", "OUTBOX_WORKERS",
-		"AUTH_REQUIRED", "AUTH_DEV_TOKEN",
 		"OTEL_EXPORTER_OTLP_ENDPOINT", "OTEL_EXPORTER_OTLP_INSECURE",
 		"OTEL_SERVICE_NAME", "OTEL_SERVICE_VERSION",
 		"OTEL_TRACES_SAMPLER", "OTEL_TRACES_SAMPLER_ARG",
@@ -106,7 +105,6 @@ func TestLoad_Defaults(t *testing.T) {
 		{"Kafka.Brokers", cfg.Kafka.BootstrapServers(), "localhost:9092"},
 		{"Outbox.Topic", cfg.Outbox.Topic, "fintech.ledger.transactions"},
 		{"Outbox.Workers", cfg.Outbox.Workers, 4},
-		{"Auth.Required", cfg.Auth.Required, false},
 		{"OTel.ServiceName", cfg.OTel.ServiceName, "ledger-svc"},
 		{"OTel.Sampler", cfg.OTel.Sampler, "always_on"},
 	}
@@ -147,7 +145,6 @@ func TestLoad_TypeErrors(t *testing.T) {
 		match string
 	}{
 		{"OUTBOX_WORKERS not int", "OUTBOX_WORKERS", "many", `"Workers"`},
-		{"AUTH_REQUIRED not bool", "AUTH_REQUIRED", "yesplease", `"Required"`},
 		{"GRPC_SHUTDOWN_TIMEOUT not duration", "GRPC_SHUTDOWN_TIMEOUT", "soon", `"ShutdownTimeout"`},
 	}
 	for _, tc := range cases {
@@ -175,11 +172,6 @@ func TestValidate_CrossField(t *testing.T) {
 		mutate  func(*Config)
 		wantErr string
 	}{
-		{
-			name:    "auth required without dev token",
-			mutate:  func(c *Config) { c.Auth.Required = true; c.Auth.DevToken = "" },
-			wantErr: "AUTH_REQUIRED=true",
-		},
 		{
 			name:    "outbox workers zero",
 			mutate:  func(c *Config) { c.Outbox.Workers = 0 },
@@ -223,7 +215,6 @@ func TestValidate_OK(t *testing.T) {
 		Outbox: OutboxConfig{Workers: 4},
 		DB:     DBConfig{MaxConns: 20, MinConns: 4},
 		OTel:   OTelConfig{Sampler: "always_on"},
-		Auth:   AuthConfig{Required: false},
 	}
 	if err := c.Validate(); err != nil {
 		t.Fatalf("expected no error, got %v", err)

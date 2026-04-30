@@ -183,11 +183,19 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 	worker.Run(workerCtx)
 	log.Info("outbox worker started", slog.Int("concurrency", cfg.Outbox.Workers))
 
-	// gRPC transport.
+	// gRPC transport. ledger-svc is internal-only; the BFF validates the
+	// caller's JWT and forwards the resolved actor identity as headers
+	// (x-tenant-id, x-actor-subject, x-actor-session). The interceptor
+	// just trusts and parses those — service-mesh / network policy is
+	// what keeps non-BFF callers out, not anything in this process.
 	handler := transportgrpc.NewLedgerHandler(transferUC, ledgerRepo, log)
-	authCfg := buildAuthConfig(cfg.Auth, log)
 	srv, err := transportgrpc.New(
-		transportgrpc.ServerConfig{Addr: cfg.GRPC.Addr, Auth: authCfg},
+		transportgrpc.ServerConfig{
+			Addr: cfg.GRPC.Addr,
+			EdgeIdentity: interceptors.EdgeIdentityConfig{
+				PublicMethods: interceptors.DefaultPublicMethods(),
+			},
+		},
 		handler,
 		log,
 	)
@@ -244,47 +252,3 @@ func newLogger(level string) *slog.Logger {
 	return slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: lvl}))
 }
 
-// buildAuthConfig translates the typed AuthConfig into the interceptor's
-// AuthConfig. Policy:
-//
-//	Required=true  + DevToken=<x>  → Required + DevTokenVerifier
-//	                                 (CI / dev only — token is a plain
-//	                                  string, no signature).
-//	Required=true  + no token      → Required + RejectAllVerifier
-//	                                 (deliberate fail-closed: every RPC
-//	                                  returns Unauthenticated until a
-//	                                  real verifier is wired). Note:
-//	                                  config.Validate() actually rejects
-//	                                  this combo at boot — RejectAll is
-//	                                  defense-in-depth in case Validate
-//	                                  ever loosens.
-//	Required=false (default)       → best-effort; if a token is present
-//	                                 and a verifier is wired, claims
-//	                                 populated; otherwise request proceeds
-//	                                 with nil claims.
-//
-// Production wiring will swap DevTokenVerifier for a JWKS-backed JWT
-// verifier or an OAuth2 introspection client — a one-line change.
-func buildAuthConfig(auth config.AuthConfig, log *slog.Logger) interceptors.AuthConfig {
-	out := interceptors.AuthConfig{
-		Required:      auth.Required,
-		PublicMethods: interceptors.DefaultPublicMethods(),
-	}
-	switch {
-	case auth.DevToken != "":
-		log.Warn("using DevTokenVerifier — DO NOT enable in production",
-			slog.Bool("auth_required", auth.Required))
-		out.Verifier = &interceptors.DevTokenVerifier{
-			Token: auth.DevToken,
-			Claims: interceptors.Claims{
-				Subject: "dev",
-				Tenant:  "default",
-				Scopes:  []string{"ledger.transfer", "ledger.read"},
-			},
-		}
-	case auth.Required:
-		log.Warn("AUTH_REQUIRED=true but no verifier wired — RejectAllVerifier installed (every RPC will Unauthenticated)")
-		out.Verifier = interceptors.RejectAllVerifier()
-	}
-	return out
-}
