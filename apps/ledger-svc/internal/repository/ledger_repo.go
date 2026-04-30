@@ -50,8 +50,8 @@ const (
 		VALUES ($1, $2, $3, $4, $5)`
 
 	insertJournalEntrySQL = `
-		INSERT INTO journal_entries (id, transaction_id, account_id, amount, currency, created_at)
-		VALUES ($1, $2, $3, $4, $5, $6)`
+		INSERT INTO journal_entries (id, transaction_id, tenant_id, account_id, amount, currency, created_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7)`
 
 	insertOutboxEventSQL = `
 		INSERT INTO outbox_events (id, aggregate_type, aggregate_id, payload, status, created_at)
@@ -68,7 +68,7 @@ const (
 		WHERE tenant_id = $1 AND idempotency_key = $2`
 
 	selectJournalEntriesSQL = `
-		SELECT id, transaction_id, account_id, amount, currency, created_at
+		SELECT id, transaction_id, tenant_id, account_id, amount, currency, created_at
 		FROM journal_entries
 		WHERE transaction_id = $1
 		ORDER BY created_at, id`
@@ -105,6 +105,7 @@ func (r *LedgerRepo) ExecuteTransfer(ctx context.Context, req domain.TransferReq
 	debitLeg := domain.JournalEntry{
 		ID:            r.newID(),
 		TransactionID: txID,
+		TenantID:      req.TenantID,
 		AccountID:     req.FromAccountID,
 		Amount:        req.Amount.Neg(),
 		Currency:      req.Currency,
@@ -113,6 +114,7 @@ func (r *LedgerRepo) ExecuteTransfer(ctx context.Context, req domain.TransferReq
 	creditLeg := domain.JournalEntry{
 		ID:            r.newID(),
 		TransactionID: txID,
+		TenantID:      req.TenantID,
 		AccountID:     req.ToAccountID,
 		Amount:        req.Amount,
 		Currency:      req.Currency,
@@ -149,9 +151,15 @@ func (r *LedgerRepo) ExecuteTransfer(ctx context.Context, req domain.TransferReq
 		for i := range transaction.Entries {
 			leg := transaction.Entries[i]
 			if _, err := tx.Exec(ctx, insertJournalEntrySQL,
-				leg.ID, leg.TransactionID, leg.AccountID,
+				leg.ID, leg.TransactionID, leg.TenantID, leg.AccountID,
 				leg.Amount, string(leg.Currency), leg.CreatedAt,
 			); err != nil {
+				// Composite FKs reject cross-tenant accounts and tx/leg
+				// tenant mismatches at insert time. Mapping the FK
+				// violation here keeps the policy decision in the domain.
+				if IsForeignKeyViolation(err) {
+					return domain.ErrAccountTenantMismatch
+				}
 				return fmt.Errorf("insert journal entry: %w", err)
 			}
 		}
@@ -218,7 +226,7 @@ func (r *LedgerRepo) loadTransaction(ctx context.Context, headerSQL string, args
 	for rows.Next() {
 		var e domain.JournalEntry
 		var currStr string
-		if err := rows.Scan(&e.ID, &e.TransactionID, &e.AccountID, &e.Amount, &currStr, &e.CreatedAt); err != nil {
+		if err := rows.Scan(&e.ID, &e.TransactionID, &e.TenantID, &e.AccountID, &e.Amount, &currStr, &e.CreatedAt); err != nil {
 			return nil, fmt.Errorf("repository: scan journal entry: %w", err)
 		}
 		e.Currency = domain.Currency(currStr)

@@ -29,6 +29,14 @@ var (
 	// from auth claims, never from the request body.
 	ErrTenantRequired = errors.New("domain: tenant is required")
 
+	// ErrAccountTenantMismatch is returned when a transfer references an
+	// account that doesn't belong to the requesting tenant. The schema
+	// enforces this via composite FK on (account_id, tenant_id); the repo
+	// translates the resulting 23503 into this sentinel. Maps to
+	// codes.PermissionDenied at the gRPC boundary — the caller is asking
+	// to touch a resource they don't own.
+	ErrAccountTenantMismatch = errors.New("domain: account does not belong to tenant")
+
 	// ErrTransferInFlight indicates an existing request under the same
 	// idempotency key is still STARTED. Caller should retry after a short
 	// delay; the response will eventually settle to a stored transaction

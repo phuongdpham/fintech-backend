@@ -26,15 +26,21 @@ func (s AccountStatus) Valid() bool {
 //
 // Currency is fixed at creation and immutable — a journal entry in a
 // different currency is a domain error, enforced both here and by the
-// composite FK in PostgreSQL.
+// composite FK in PostgreSQL. TenantID is similarly fixed; a journal
+// entry whose tenant doesn't match the account's owning tenant fails
+// at write time via the composite FK on (account_id, tenant_id).
 type Account struct {
 	ID        uuid.UUID
+	TenantID  string
 	Currency  Currency
 	Status    AccountStatus
 	CreatedAt time.Time
 }
 
-func NewAccount(id uuid.UUID, currency Currency, status AccountStatus, createdAt time.Time) (*Account, error) {
+func NewAccount(id uuid.UUID, tenantID string, currency Currency, status AccountStatus, createdAt time.Time) (*Account, error) {
+	if tenantID == "" {
+		return nil, ErrTenantRequired
+	}
 	if !currency.Valid() {
 		return nil, ErrInvalidCurrency
 	}
@@ -43,6 +49,7 @@ func NewAccount(id uuid.UUID, currency Currency, status AccountStatus, createdAt
 	}
 	return &Account{
 		ID:        id,
+		TenantID:  tenantID,
 		Currency:  currency,
 		Status:    status,
 		CreatedAt: createdAt,

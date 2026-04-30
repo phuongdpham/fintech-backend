@@ -18,9 +18,14 @@ import (
 //
 // 23505 (unique_violation) is surfaced upward as a domain error
 // (idempotency-key collision); never retried.
+//
+// 23503 (foreign_key_violation) is the schema-level rejection of a journal
+// entry pointing at an account in a different tenant (or a tx/leg tenant
+// mismatch). Surfaced as ErrAccountTenantMismatch.
 const (
 	pgSerializationFailureCode = "40001"
 	pgUniqueViolationCode      = "23505"
+	pgForeignKeyViolationCode  = "23503"
 )
 
 // RetryConfig governs the exponential-backoff loop. Defaults aim for low
@@ -55,6 +60,13 @@ func IsSerializationFailure(err error) bool {
 func IsUniqueViolation(err error) bool {
 	var pgErr *pgconn.PgError
 	return errors.As(err, &pgErr) && pgErr.Code == pgUniqueViolationCode
+}
+
+// IsForeignKeyViolation reports whether err originated as a Postgres
+// SQLSTATE 23503 (foreign-key violation).
+func IsForeignKeyViolation(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == pgForeignKeyViolationCode
 }
 
 // WithRetryOnSerializationFailure invokes fn, retrying with exponential

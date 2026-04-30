@@ -9,25 +9,32 @@ import (
 // JournalEntry is one leg of a double-entry transaction.
 // Sign convention matches the Amount type: negative = debit, positive = credit.
 //
-// The composite (AccountID, Currency) tuple maps 1:1 to the DB's composite
-// FK against accounts(id, currency); a mismatch is a programming error and
-// will fail at write time.
+// Two composite tuples map 1:1 to DB-level composite FKs:
+//   (AccountID, Currency)  -> accounts(id, currency)         — currency lock
+//   (AccountID, TenantID)  -> accounts(id, tenant_id)        — tenant lock
+//   (TransactionID, TenantID) -> transactions(id, tenant_id) — tx lock
+// A mismatch is a programming error and fails at write time.
 type JournalEntry struct {
 	ID            uuid.UUID
 	TransactionID uuid.UUID
+	TenantID      string
 	AccountID     uuid.UUID
 	Amount        Amount
 	Currency      Currency
 	CreatedAt     time.Time
 }
 
-func NewJournalEntry(id, txID, accountID uuid.UUID, amount Amount, currency Currency, createdAt time.Time) (JournalEntry, error) {
+func NewJournalEntry(id, txID uuid.UUID, tenantID string, accountID uuid.UUID, amount Amount, currency Currency, createdAt time.Time) (JournalEntry, error) {
+	if tenantID == "" {
+		return JournalEntry{}, ErrTenantRequired
+	}
 	if !currency.Valid() {
 		return JournalEntry{}, ErrInvalidCurrency
 	}
 	return JournalEntry{
 		ID:            id,
 		TransactionID: txID,
+		TenantID:      tenantID,
 		AccountID:     accountID,
 		Amount:        amount,
 		Currency:      currency,
