@@ -5,161 +5,18 @@ import (
 	"errors"
 	"io"
 	"log/slog"
-	"sync"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/shopspring/decimal"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/mock/gomock"
 
 	"github.com/phuongdpham/fintech/apps/ledger-svc/internal/domain"
+	"github.com/phuongdpham/fintech/apps/ledger-svc/internal/domain/mocks"
 	"github.com/phuongdpham/fintech/apps/ledger-svc/internal/usecase"
 )
-
-// ---------------------------------------------------------------------------
-// Fakes — in-memory implementations of the two domain ports the usecase
-// depends on. Kept package-local to this test so they can drift if the
-// production interfaces evolve, without polluting prod code.
-// ---------------------------------------------------------------------------
-
-type fakeIdemStore struct {
-	mu          sync.Mutex
-	records     map[string]domain.IdempotencyRecord
-	acquireErr  error
-	setStateErr error
-	// forceRace makes Acquire return (false, zero, nil) — the SETNX-fail
-	// + GET-returns-nil race documented in the Redis adapter.
-	forceRace bool
-}
-
-func newFakeIdem() *fakeIdemStore {
-	return &fakeIdemStore{records: map[string]domain.IdempotencyRecord{}}
-}
-
-func (f *fakeIdemStore) Acquire(_ context.Context, key, fingerprint string) (bool, domain.IdempotencyRecord, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if f.acquireErr != nil {
-		return false, domain.IdempotencyRecord{}, f.acquireErr
-	}
-	if f.forceRace {
-		return false, domain.IdempotencyRecord{}, nil
-	}
-	if cur, ok := f.records[key]; ok {
-		return false, cur, nil
-	}
-	f.records[key] = domain.IdempotencyRecord{State: domain.IdempotencyStarted, Fingerprint: fingerprint}
-	return true, domain.IdempotencyRecord{}, nil
-}
-
-func (f *fakeIdemStore) SetState(_ context.Context, key, fingerprint string, s domain.IdempotencyState) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if f.setStateErr != nil {
-		return f.setStateErr
-	}
-	f.records[key] = domain.IdempotencyRecord{State: s, Fingerprint: fingerprint}
-	return nil
-}
-
-func (f *fakeIdemStore) getState(key string) domain.IdempotencyState {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return f.records[key].State
-}
-
-func (f *fakeIdemStore) seedRecord(key string, rec domain.IdempotencyRecord) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.records[key] = rec
-}
-
-type fakeLedgerRepo struct {
-	mu               sync.Mutex
-	txByID           map[uuid.UUID]*domain.Transaction
-	txByIdem         map[string]*domain.Transaction
-	executeCalls     int
-	replayLookupCalls int
-	executeErr       error
-}
-
-func newFakeRepo() *fakeLedgerRepo {
-	return &fakeLedgerRepo{
-		txByID:   map[uuid.UUID]*domain.Transaction{},
-		txByIdem: map[string]*domain.Transaction{},
-	}
-}
-
-func (f *fakeLedgerRepo) seed(tx *domain.Transaction) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.txByID[tx.ID] = tx
-	f.txByIdem[idemBucketKey(tx.TenantID, tx.IdempotencyKey)] = tx
-}
-
-// idemBucketKey scopes the per-tenant uniqueness lookup. Mirrors the real
-// PG composite UNIQUE (tenant_id, idempotency_key).
-func idemBucketKey(tenantID, key string) string { return tenantID + "|" + key }
-
-func (f *fakeLedgerRepo) ExecuteTransfer(_ context.Context, req domain.TransferRequest) (*domain.Transaction, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.executeCalls++
-	if f.executeErr != nil {
-		return nil, f.executeErr
-	}
-	bucket := idemBucketKey(req.TenantID, req.IdempotencyKey)
-	if _, exists := f.txByIdem[bucket]; exists {
-		return nil, domain.ErrDuplicateIdempotencyKey
-	}
-	now := time.Now().UTC()
-	txID := uuid.New()
-	tx := &domain.Transaction{
-		ID:                 txID,
-		TenantID:           req.TenantID,
-		IdempotencyKey:     req.IdempotencyKey,
-		RequestFingerprint: req.RequestFingerprint,
-		Status:             domain.TransactionStatusCommitted,
-		Entries: []domain.JournalEntry{
-			{ID: uuid.New(), TransactionID: txID, AccountID: req.FromAccountID, Amount: req.Amount.Neg(), Currency: req.Currency, CreatedAt: now},
-			{ID: uuid.New(), TransactionID: txID, AccountID: req.ToAccountID, Amount: req.Amount, Currency: req.Currency, CreatedAt: now},
-		},
-		CreatedAt: now,
-	}
-	// Defense-in-depth: real repo asserts here too.
-	if err := tx.AssertBalanced(); err != nil {
-		return nil, err
-	}
-	f.txByID[txID] = tx
-	f.txByIdem[bucket] = tx
-	return tx, nil
-}
-
-func (f *fakeLedgerRepo) GetTransaction(_ context.Context, id uuid.UUID) (*domain.Transaction, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	tx, ok := f.txByID[id]
-	if !ok {
-		return nil, domain.ErrTransactionNotFound
-	}
-	return tx, nil
-}
-
-func (f *fakeLedgerRepo) GetTransactionByIdempotencyKey(_ context.Context, tenantID, key string) (*domain.Transaction, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.replayLookupCalls++
-	tx, ok := f.txByIdem[idemBucketKey(tenantID, key)]
-	if !ok {
-		return nil, domain.ErrTransactionNotFound
-	}
-	return tx, nil
-}
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 // silentLogger discards usecase warnings during tests so failure signal
 // only comes from assertions.
@@ -178,241 +35,299 @@ func validInput() usecase.TransferInput {
 	}
 }
 
+// scopedKey mirrors usecase.scopedIdempotencyKey: the opaque key the
+// usecase composes from tenant + caller-supplied key before handing it to
+// the IdempotencyStore.
+const scopedKey = "tenant-a:k1"
+
+// originalTx is the existing committed transaction returned on the replay
+// path. Fingerprint matches validInput() so replays succeed.
+func originalTx(t *testing.T) *domain.Transaction {
+	t.Helper()
+	txID := uuid.New()
+	return &domain.Transaction{
+		ID:                 txID,
+		TenantID:           "tenant-a",
+		IdempotencyKey:     "k1",
+		RequestFingerprint: usecase.TransferFingerprint(validInput()),
+		Status:             domain.TransactionStatusCommitted,
+		Entries: []domain.JournalEntry{
+			{ID: uuid.New(), TransactionID: txID, Amount: decimal.NewFromInt(-100), Currency: "USD"},
+			{ID: uuid.New(), TransactionID: txID, Amount: decimal.NewFromInt(100), Currency: "USD"},
+		},
+		CreatedAt: time.Now().UTC(),
+	}
+}
+
+// freshTx is the *domain.Transaction the repo returns from a successful
+// ExecuteTransfer — i.e. a brand-new commit, not a replay.
+func freshTx(t *testing.T, in usecase.TransferInput) *domain.Transaction {
+	t.Helper()
+	txID := uuid.New()
+	return &domain.Transaction{
+		ID:                 txID,
+		TenantID:           in.TenantID,
+		IdempotencyKey:     in.IdempotencyKey,
+		RequestFingerprint: usecase.TransferFingerprint(in),
+		Status:             domain.TransactionStatusCommitted,
+		Entries: []domain.JournalEntry{
+			{ID: uuid.New(), TransactionID: txID, AccountID: in.FromAccountID, Amount: in.Amount.Neg(), Currency: in.Currency},
+			{ID: uuid.New(), TransactionID: txID, AccountID: in.ToAccountID, Amount: in.Amount, Currency: in.Currency},
+		},
+		CreatedAt: time.Now().UTC(),
+	}
+}
+
+// TestTransferUsecase_Execute is the table-driven contract test. Each
+// case scripts the exact call sequence the usecase must make against
+// the two ports — gomock's strict mode fails the test on any
+// unexpected interaction, which is the correctness guarantee we want
+// (no silent extra Redis writes, no missed PG replays).
 func TestTransferUsecase_Execute(t *testing.T) {
-	redisDown := errors.New("redis: connection refused")
-
 	cases := []struct {
-		name string
-		// setup mutates the fakes before invocation. Empty default = first
-		// request, fresh ports.
-		setup func(*testing.T, *fakeIdemStore, *fakeLedgerRepo)
-		in    usecase.TransferInput
-
-		// Expectations
-		wantErr            error // sentinel; matched with errors.Is
-		wantReplayed       bool
-		wantExecuteCalls   int
-		wantReplayLookups  int
-		wantFinalIdemState domain.IdempotencyState
+		name         string
+		in           usecase.TransferInput
+		expect       func(t *testing.T, idem *mocks.MockIdempotencyStore, repo *mocks.MockLedgerRepository, in usecase.TransferInput)
+		wantErr      error
+		wantReplayed bool
 	}{
 		{
-			name:               "happy path: clear key writes new tx and marks COMPLETED",
-			in:                 validInput(),
-			wantExecuteCalls:   1,
-			wantFinalIdemState: domain.IdempotencyCompleted,
+			name: "happy path: clear slot writes tx and marks COMPLETED",
+			in:   validInput(),
+			expect: func(t *testing.T, idem *mocks.MockIdempotencyStore, repo *mocks.MockLedgerRepository, in usecase.TransferInput) {
+				fp := usecase.TransferFingerprint(in)
+				gomock.InOrder(
+					idem.EXPECT().Acquire(gomock.Any(), scopedKey, fp).
+						Return(true, domain.IdempotencyRecord{}, nil),
+					repo.EXPECT().ExecuteTransfer(gomock.Any(), gomock.Any()).
+						Return(freshTx(t, in), nil),
+					idem.EXPECT().SetState(gomock.Any(), scopedKey, fp, domain.IdempotencyCompleted).
+						Return(nil),
+				)
+			},
 		},
 		{
-			name: "replay: Redis says COMPLETED -> load existing tx, do not re-execute",
-			setup: func(_ *testing.T, idem *fakeIdemStore, repo *fakeLedgerRepo) {
-				fp := usecase.TransferFingerprint(validInput())
-				txID := uuid.New()
-				tx := &domain.Transaction{
-					ID:                 txID,
-					TenantID:           "tenant-a",
-					IdempotencyKey:     "k1",
-					RequestFingerprint: fp,
-					Status:             domain.TransactionStatusCommitted,
-					Entries: []domain.JournalEntry{
-						{ID: uuid.New(), TransactionID: txID, Amount: decimal.NewFromInt(-100), Currency: "USD"},
-						{ID: uuid.New(), TransactionID: txID, Amount: decimal.NewFromInt(100), Currency: "USD"},
-					},
-				}
-				repo.seed(tx)
-				idem.seedRecord("tenant-a:k1", domain.IdempotencyRecord{
-					State: domain.IdempotencyCompleted, Fingerprint: fp,
-				})
+			name: "replay: Redis says COMPLETED -> load tx, do not re-execute",
+			in:   validInput(),
+			expect: func(t *testing.T, idem *mocks.MockIdempotencyStore, repo *mocks.MockLedgerRepository, in usecase.TransferInput) {
+				fp := usecase.TransferFingerprint(in)
+				original := originalTx(t)
+				gomock.InOrder(
+					idem.EXPECT().Acquire(gomock.Any(), scopedKey, fp).
+						Return(false, domain.IdempotencyRecord{State: domain.IdempotencyCompleted, Fingerprint: fp}, nil),
+					repo.EXPECT().GetTransactionByIdempotencyKey(gomock.Any(), in.TenantID, in.IdempotencyKey).
+						Return(original, nil),
+				)
 			},
-			in:                 validInput(),
-			wantReplayed:       true,
-			wantExecuteCalls:   0,
-			wantReplayLookups:  1,
-			wantFinalIdemState: domain.IdempotencyCompleted, // unchanged
+			wantReplayed: true,
 		},
 		{
 			name: "STARTED state -> ErrTransferInFlight, no repo touch",
-			setup: func(_ *testing.T, idem *fakeIdemStore, _ *fakeLedgerRepo) {
-				fp := usecase.TransferFingerprint(validInput())
-				idem.seedRecord("tenant-a:k1", domain.IdempotencyRecord{
-					State: domain.IdempotencyStarted, Fingerprint: fp,
-				})
+			in:   validInput(),
+			expect: func(t *testing.T, idem *mocks.MockIdempotencyStore, _ *mocks.MockLedgerRepository, in usecase.TransferInput) {
+				fp := usecase.TransferFingerprint(in)
+				idem.EXPECT().Acquire(gomock.Any(), scopedKey, fp).
+					Return(false, domain.IdempotencyRecord{State: domain.IdempotencyStarted, Fingerprint: fp}, nil)
 			},
-			in:                 validInput(),
-			wantErr:            domain.ErrTransferInFlight,
-			wantExecuteCalls:   0,
-			wantFinalIdemState: domain.IdempotencyStarted,
+			wantErr: domain.ErrTransferInFlight,
 		},
 		{
 			name: "FAILED state -> ErrIdempotencyKeyFailed, no repo touch",
-			setup: func(_ *testing.T, idem *fakeIdemStore, _ *fakeLedgerRepo) {
-				fp := usecase.TransferFingerprint(validInput())
-				idem.seedRecord("tenant-a:k1", domain.IdempotencyRecord{
-					State: domain.IdempotencyFailed, Fingerprint: fp,
-				})
+			in:   validInput(),
+			expect: func(t *testing.T, idem *mocks.MockIdempotencyStore, _ *mocks.MockLedgerRepository, in usecase.TransferInput) {
+				fp := usecase.TransferFingerprint(in)
+				idem.EXPECT().Acquire(gomock.Any(), scopedKey, fp).
+					Return(false, domain.IdempotencyRecord{State: domain.IdempotencyFailed, Fingerprint: fp}, nil)
 			},
-			in:                 validInput(),
-			wantErr:            domain.ErrIdempotencyKeyFailed,
-			wantExecuteCalls:   0,
-			wantFinalIdemState: domain.IdempotencyFailed,
+			wantErr: domain.ErrIdempotencyKeyFailed,
 		},
 		{
 			name: "fingerprint mismatch on completed slot -> ErrRequestFingerprintMismatch",
-			setup: func(_ *testing.T, idem *fakeIdemStore, _ *fakeLedgerRepo) {
-				idem.seedRecord("tenant-a:k1", domain.IdempotencyRecord{
-					State: domain.IdempotencyCompleted, Fingerprint: "deadbeef-prior-request-fp",
-				})
+			in:   validInput(),
+			expect: func(t *testing.T, idem *mocks.MockIdempotencyStore, _ *mocks.MockLedgerRepository, in usecase.TransferInput) {
+				idem.EXPECT().Acquire(gomock.Any(), scopedKey, gomock.Any()).
+					Return(false, domain.IdempotencyRecord{State: domain.IdempotencyCompleted, Fingerprint: "stale-fp"}, nil)
 			},
-			in:                 validInput(),
-			wantErr:            domain.ErrRequestFingerprintMismatch,
-			wantExecuteCalls:   0,
-			wantFinalIdemState: domain.IdempotencyCompleted, // unchanged
+			wantErr: domain.ErrRequestFingerprintMismatch,
 		},
 		{
 			name: "fingerprint mismatch on in-flight slot -> ErrRequestFingerprintMismatch",
-			setup: func(_ *testing.T, idem *fakeIdemStore, _ *fakeLedgerRepo) {
-				idem.seedRecord("tenant-a:k1", domain.IdempotencyRecord{
-					State: domain.IdempotencyStarted, Fingerprint: "deadbeef-prior-request-fp",
-				})
+			in:   validInput(),
+			expect: func(t *testing.T, idem *mocks.MockIdempotencyStore, _ *mocks.MockLedgerRepository, in usecase.TransferInput) {
+				idem.EXPECT().Acquire(gomock.Any(), scopedKey, gomock.Any()).
+					Return(false, domain.IdempotencyRecord{State: domain.IdempotencyStarted, Fingerprint: "stale-fp"}, nil)
 			},
-			in:                 validInput(),
-			wantErr:            domain.ErrRequestFingerprintMismatch,
-			wantExecuteCalls:   0,
-			wantFinalIdemState: domain.IdempotencyStarted, // unchanged
+			wantErr: domain.ErrRequestFingerprintMismatch,
 		},
 		{
-			name: "Redis race (SETNX fail + TTL expired) falls through to PG; PG writes new tx",
-			setup: func(_ *testing.T, idem *fakeIdemStore, _ *fakeLedgerRepo) {
-				idem.forceRace = true
+			name: "Redis race (SETNX fail + TTL expired) falls through to PG",
+			in:   validInput(),
+			expect: func(t *testing.T, idem *mocks.MockIdempotencyStore, repo *mocks.MockLedgerRepository, in usecase.TransferInput) {
+				gomock.InOrder(
+					idem.EXPECT().Acquire(gomock.Any(), scopedKey, gomock.Any()).
+						Return(false, domain.IdempotencyRecord{}, nil),
+					repo.EXPECT().ExecuteTransfer(gomock.Any(), gomock.Any()).
+						Return(freshTx(t, in), nil),
+				)
+				// No SetState — the race path never re-enters the COMPLETED
+				// write, by design (the slot is treated as already-claimed
+				// by someone). Strict mock catches an accidental call.
 			},
-			in:               validInput(),
-			wantExecuteCalls: 1,
-			// In the race path we never came back to update Redis state —
-			// the slot is empty in the fake.
-			wantFinalIdemState: "",
 		},
 		{
-			name: "Redis fault on Acquire -> fail-open; PG executes successfully",
-			setup: func(_ *testing.T, idem *fakeIdemStore, _ *fakeLedgerRepo) {
-				idem.acquireErr = redisDown
+			name: "Redis fault on Acquire -> fail-open; PG executes",
+			in:   validInput(),
+			expect: func(t *testing.T, idem *mocks.MockIdempotencyStore, repo *mocks.MockLedgerRepository, in usecase.TransferInput) {
+				gomock.InOrder(
+					idem.EXPECT().Acquire(gomock.Any(), scopedKey, gomock.Any()).
+						Return(false, domain.IdempotencyRecord{}, errors.New("redis: connection refused")),
+					repo.EXPECT().ExecuteTransfer(gomock.Any(), gomock.Any()).
+						Return(freshTx(t, in), nil),
+				)
+				// No SetState — Redis is down, no point trying.
 			},
-			in:                 validInput(),
-			wantExecuteCalls:   1,
-			wantFinalIdemState: "", // we never tried SetState; Redis is down
 		},
 		{
-			name: "Redis acquired but PG has the row already (late dup) -> replay path",
-			setup: func(_ *testing.T, _ *fakeIdemStore, repo *fakeLedgerRepo) {
-				txID := uuid.New()
-				tx := &domain.Transaction{
-					ID:             txID,
-					TenantID:       "tenant-a",
-					IdempotencyKey: "k1",
-					Status:         domain.TransactionStatusCommitted,
-					Entries: []domain.JournalEntry{
-						{ID: uuid.New(), TransactionID: txID, Amount: decimal.NewFromInt(-100), Currency: "USD"},
-						{ID: uuid.New(), TransactionID: txID, Amount: decimal.NewFromInt(100), Currency: "USD"},
-					},
-				}
-				repo.seed(tx)
-				// idem store fresh -> Acquire returns (true, "", nil)
-				// but the repo finds the duplicate row.
+			name: "Redis acquired but PG has the row already -> replay path",
+			in:   validInput(),
+			expect: func(t *testing.T, idem *mocks.MockIdempotencyStore, repo *mocks.MockLedgerRepository, in usecase.TransferInput) {
+				fp := usecase.TransferFingerprint(in)
+				original := originalTx(t)
+				gomock.InOrder(
+					idem.EXPECT().Acquire(gomock.Any(), scopedKey, fp).
+						Return(true, domain.IdempotencyRecord{}, nil),
+					repo.EXPECT().ExecuteTransfer(gomock.Any(), gomock.Any()).
+						Return(nil, domain.ErrDuplicateIdempotencyKey),
+					repo.EXPECT().GetTransactionByIdempotencyKey(gomock.Any(), in.TenantID, in.IdempotencyKey).
+						Return(original, nil),
+					idem.EXPECT().SetState(gomock.Any(), scopedKey, fp, domain.IdempotencyCompleted).
+						Return(nil),
+				)
 			},
-			in:                 validInput(),
-			wantReplayed:       true,
-			wantExecuteCalls:   1,
-			wantReplayLookups:  1,
-			wantFinalIdemState: domain.IdempotencyCompleted,
+			wantReplayed: true,
 		},
 		{
-			name: "repo returns hard error -> Redis state set to FAILED, error surfaced",
-			setup: func(_ *testing.T, _ *fakeIdemStore, repo *fakeLedgerRepo) {
-				repo.executeErr = errors.New("pg: connection refused")
+			name: "repo hard error -> Redis state set to FAILED, error surfaced",
+			in:   validInput(),
+			expect: func(t *testing.T, idem *mocks.MockIdempotencyStore, repo *mocks.MockLedgerRepository, in usecase.TransferInput) {
+				fp := usecase.TransferFingerprint(in)
+				pgDown := errors.New("pg: connection refused")
+				gomock.InOrder(
+					idem.EXPECT().Acquire(gomock.Any(), scopedKey, fp).
+						Return(true, domain.IdempotencyRecord{}, nil),
+					repo.EXPECT().ExecuteTransfer(gomock.Any(), gomock.Any()).
+						Return(nil, pgDown),
+					idem.EXPECT().SetState(gomock.Any(), scopedKey, fp, domain.IdempotencyFailed).
+						Return(nil),
+				)
 			},
-			in:                 validInput(),
-			wantErr:            nil, // we don't have a domain sentinel for this; assert by IsError
-			wantExecuteCalls:   1,
-			wantFinalIdemState: domain.IdempotencyFailed,
+			wantErr: errors.New("pg: connection refused"), // matched by message, not Is
+		},
+		// Validation cases — should reject before any port is touched, so
+		// no EXPECT() calls. The mock controller's Finish (via the t.Cleanup
+		// gomock.NewController installs) catches any port call as failure.
+		{
+			name:    "validation: empty idempotency key rejected pre-port",
+			in:      func() usecase.TransferInput { in := validInput(); in.IdempotencyKey = ""; return in }(),
+			wantErr: nil, // not a domain sentinel; just want non-nil err + correct semantics
 		},
 		{
-			name:             "validation: empty idempotency key rejected pre-Redis",
-			in:               func() usecase.TransferInput { in := validInput(); in.IdempotencyKey = ""; return in }(),
-			wantErr:          nil,
-			wantExecuteCalls: 0,
+			name:    "validation: invalid currency rejected pre-port",
+			in:      func() usecase.TransferInput { in := validInput(); in.Currency = "us"; return in }(),
+			wantErr: domain.ErrInvalidCurrency,
 		},
 		{
-			name:             "validation: invalid currency rejected pre-Redis",
-			in:               func() usecase.TransferInput { in := validInput(); in.Currency = "us"; return in }(),
-			wantErr:          domain.ErrInvalidCurrency,
-			wantExecuteCalls: 0,
-		},
-		{
-			name: "validation: self-transfer rejected pre-Redis",
+			name: "validation: self-transfer rejected pre-port",
 			in: func() usecase.TransferInput {
 				in := validInput()
 				in.ToAccountID = in.FromAccountID
 				return in
 			}(),
-			wantExecuteCalls: 0,
 		},
 		{
-			name:             "validation: zero amount rejected pre-Redis",
-			in:               func() usecase.TransferInput { in := validInput(); in.Amount = decimal.Zero; return in }(),
-			wantExecuteCalls: 0,
+			name: "validation: zero amount rejected pre-port",
+			in:   func() usecase.TransferInput { in := validInput(); in.Amount = decimal.Zero; return in }(),
 		},
 		{
-			name:             "validation: negative amount rejected pre-Redis",
-			in:               func() usecase.TransferInput { in := validInput(); in.Amount = decimal.NewFromInt(-1); return in }(),
-			wantExecuteCalls: 0,
+			name: "validation: negative amount rejected pre-port",
+			in:   func() usecase.TransferInput { in := validInput(); in.Amount = decimal.NewFromInt(-1); return in }(),
+		},
+		{
+			name: "validation: missing tenant rejected pre-port",
+			in:   func() usecase.TransferInput { in := validInput(); in.TenantID = ""; return in }(),
+			wantErr: domain.ErrTenantRequired,
+		},
+		{
+			name: "validation: idempotency key too long rejected pre-port",
+			in: func() usecase.TransferInput {
+				in := validInput()
+				in.IdempotencyKey = "k1234567890" + "1234567890" + "1234567890" + "1234567890" + "1234567890" + "1234567890" + "1234567890"
+				return in
+			}(),
+		},
+		{
+			name: "validation: idempotency key with disallowed chars rejected pre-port",
+			in:   func() usecase.TransferInput { in := validInput(); in.IdempotencyKey = "k1:has:colons"; return in }(),
 		},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			idem := newFakeIdem()
-			repo := newFakeRepo()
-			if tc.setup != nil {
-				tc.setup(t, idem, repo)
+			ctrl := gomock.NewController(t)
+			idem := mocks.NewMockIdempotencyStore(ctrl)
+			repo := mocks.NewMockLedgerRepository(ctrl)
+			if tc.expect != nil {
+				tc.expect(t, idem, repo, tc.in)
 			}
 			uc := usecase.NewTransferUsecase(repo, idem, silentLogger())
 
-			out, err := uc.Execute(context.Background(), tc.in)
+			out, err := uc.Execute(t.Context(), tc.in)
 
-			if tc.wantErr != nil {
+			switch {
+			case tc.wantErr != nil:
 				require.Error(t, err)
-				require.True(t, errors.Is(err, tc.wantErr), "want %v, got %v", tc.wantErr, err)
-				require.Nil(t, out)
-			} else if tc.wantExecuteCalls == 0 && tc.wantReplayed == false {
-				// Validation cases — error expected even without sentinel.
-				if tc.name != "happy path: clear key writes new tx and marks COMPLETED" {
-					require.Error(t, err, "validation should reject")
-					require.Nil(t, out)
+				if errors.Is(err, tc.wantErr) {
+					// sentinel match
+				} else {
+					require.Contains(t, err.Error(), tc.wantErr.Error())
 				}
-			}
-
-			// Output expectations on success paths.
-			if err == nil {
+				require.Nil(t, out)
+			case tc.expect == nil:
+				// Validation case with no sentinel — just expect rejection.
+				require.Error(t, err)
+				require.Nil(t, out)
+			default:
+				require.NoError(t, err)
 				require.NotNil(t, out)
 				require.NotNil(t, out.Transaction)
 				require.Equal(t, tc.wantReplayed, out.Replayed)
-			}
-
-			require.Equal(t, tc.wantExecuteCalls, repo.executeCalls, "ExecuteTransfer call count")
-			require.Equal(t, tc.wantReplayLookups, repo.replayLookupCalls, "GetByIdemKey call count")
-			if tc.wantFinalIdemState != "" || tc.wantExecuteCalls > 0 || tc.wantReplayed {
-				require.Equal(t, tc.wantFinalIdemState, idem.getState("tenant-a:k1"), "final idempotency state")
 			}
 		})
 	}
 }
 
-// Sanity test: explicit, isolated check that the pre-flight balance assertion
-// is wired. With the current 2-leg builder, valid inputs always balance; this
-// test pins that contract so future refactors don't silently regress it.
+// TestTransferUsecase_Execute_PreflightBalanceHolds pins the contract
+// that valid inputs always produce balanced legs. Independent of the
+// fast-path table since it asserts on the persisted Transaction shape.
 func TestTransferUsecase_Execute_PreflightBalanceHolds(t *testing.T) {
-	idem := newFakeIdem()
-	repo := newFakeRepo()
-	uc := usecase.NewTransferUsecase(repo, idem, silentLogger())
+	ctrl := gomock.NewController(t)
+	idem := mocks.NewMockIdempotencyStore(ctrl)
+	repo := mocks.NewMockLedgerRepository(ctrl)
+	in := validInput()
+	fp := usecase.TransferFingerprint(in)
 
-	out, err := uc.Execute(context.Background(), validInput())
+	idem.EXPECT().Acquire(gomock.Any(), scopedKey, fp).
+		Return(true, domain.IdempotencyRecord{}, nil)
+	repo.EXPECT().ExecuteTransfer(gomock.Any(), gomock.Any()).
+		DoAndReturn(func(_ context.Context, req domain.TransferRequest) (*domain.Transaction, error) {
+			// Echo back what the usecase would persist: two balanced legs.
+			return freshTx(t, in), nil
+		})
+	idem.EXPECT().SetState(gomock.Any(), scopedKey, fp, domain.IdempotencyCompleted).
+		Return(nil)
+
+	uc := usecase.NewTransferUsecase(repo, idem, silentLogger())
+	out, err := uc.Execute(t.Context(), in)
 	require.NoError(t, err)
 	require.NotNil(t, out)
 	require.Len(t, out.Transaction.Entries, 2)

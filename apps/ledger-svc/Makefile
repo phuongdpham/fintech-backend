@@ -66,6 +66,10 @@ build:  ## Build ledger-svc binaries (server, reconciler, migrate)
 test:  ## Run ledger-svc tests
 	cd $(ROOT) && pnpm exec nx run ledger-svc:test
 
+.PHONY: mocks
+mocks:  ## Regenerate gomock-based test mocks for domain ports
+	cd $(SVC_DIR) && go generate ./internal/...
+
 ##@ Migrations
 .PHONY: migrate-up
 migrate-up: $(MIGRATE_BIN)  ## Apply all pending migrations

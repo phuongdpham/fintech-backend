@@ -5,13 +5,13 @@ import (
 	"io"
 	"log/slog"
 	"net"
-	"sync"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/shopspring/decimal"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/mock/gomock"
 	gogrpc "google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
@@ -20,146 +20,48 @@ import (
 	"google.golang.org/grpc/test/bufconn"
 
 	"github.com/phuongdpham/fintech/apps/ledger-svc/internal/domain"
+	"github.com/phuongdpham/fintech/apps/ledger-svc/internal/domain/mocks"
 	transportgrpc "github.com/phuongdpham/fintech/apps/ledger-svc/internal/transport/grpc"
 	"github.com/phuongdpham/fintech/apps/ledger-svc/internal/transport/grpc/interceptors"
 	"github.com/phuongdpham/fintech/apps/ledger-svc/internal/usecase"
 	pb "github.com/phuongdpham/fintech/libs/go/proto-gen/fintech/ledger/v1"
 )
 
-// testTenant is the synthetic tenant the test harness's auth shim attaches
-// to every request. Mirrors what the real Auth interceptor would do once
-// configured with a Verifier returning Claims.Tenant.
-const testTenant = "tenant-a"
+const (
+	testTenant      = "tenant-a"
+	testIdemKey     = "k1"
+	testScopedKey   = "tenant-a:k1"
+	testFromAccount = "11111111-1111-1111-1111-111111111111"
+	testToAccount   = "22222222-2222-2222-2222-222222222222"
+)
 
-// injectTestClaims is the test-only auth shim. It pre-populates a Claims
-// record with Tenant=testTenant on every incoming request so the handler's
-// tenant-required check sees a valid tenant. Real deployments use
-// interceptors.Auth + a Verifier; this stays out of the test loop because
-// the suite is exercising handler-and-below behavior, not auth.
+// injectTestClaims is the test-only auth shim. The real EdgeIdentity
+// interceptor wants x-tenant-id / x-actor-subject headers; this short-
+// circuits straight to a populated Claims so the suite focuses on
+// handler-and-below behavior.
 func injectTestClaims(ctx context.Context, req any, _ *gogrpc.UnaryServerInfo, handler gogrpc.UnaryHandler) (any, error) {
 	ctx = interceptors.WithClaims(ctx, &interceptors.Claims{Subject: "test-user", Tenant: testTenant})
 	return handler(ctx, req)
 }
 
-// ---------------------------------------------------------------------------
-// In-memory fakes — match the contract of the production ports closely
-// enough that the handler is exercised end-to-end without Postgres or
-// Redis. Mirror of the usecase test's fakes, kept local so the two
-// suites can drift independently.
-// ---------------------------------------------------------------------------
-
-type fakeIdemStore struct {
-	mu      sync.Mutex
-	records map[string]domain.IdempotencyRecord
-}
-
-func newFakeIdem() *fakeIdemStore {
-	return &fakeIdemStore{records: map[string]domain.IdempotencyRecord{}}
-}
-func (f *fakeIdemStore) Acquire(_ context.Context, key, fingerprint string) (bool, domain.IdempotencyRecord, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if cur, ok := f.records[key]; ok {
-		return false, cur, nil
-	}
-	f.records[key] = domain.IdempotencyRecord{State: domain.IdempotencyStarted, Fingerprint: fingerprint}
-	return true, domain.IdempotencyRecord{}, nil
-}
-func (f *fakeIdemStore) SetState(_ context.Context, key, fingerprint string, s domain.IdempotencyState) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.records[key] = domain.IdempotencyRecord{State: s, Fingerprint: fingerprint}
-	return nil
-}
-
-type fakeLedgerRepo struct {
-	mu       sync.Mutex
-	txByID   map[uuid.UUID]*domain.Transaction
-	txByIdem map[string]*domain.Transaction
-}
-
-func newFakeRepo() *fakeLedgerRepo {
-	return &fakeLedgerRepo{
-		txByID:   map[uuid.UUID]*domain.Transaction{},
-		txByIdem: map[string]*domain.Transaction{},
-	}
-}
-// idemBucketKey scopes the per-tenant uniqueness lookup. Mirrors the real
-// PG composite UNIQUE (tenant_id, idempotency_key).
-func idemBucketKey(tenantID, key string) string { return tenantID + "|" + key }
-
-func (f *fakeLedgerRepo) seed(tx *domain.Transaction) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.txByID[tx.ID] = tx
-	f.txByIdem[idemBucketKey(tx.TenantID, tx.IdempotencyKey)] = tx
-}
-func (f *fakeLedgerRepo) ExecuteTransfer(_ context.Context, req domain.TransferRequest) (*domain.Transaction, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	bucket := idemBucketKey(req.TenantID, req.IdempotencyKey)
-	if _, exists := f.txByIdem[bucket]; exists {
-		return nil, domain.ErrDuplicateIdempotencyKey
-	}
-	now := time.Now().UTC()
-	txID := uuid.New()
-	tx := &domain.Transaction{
-		ID:                 txID,
-		TenantID:           req.TenantID,
-		IdempotencyKey:     req.IdempotencyKey,
-		RequestFingerprint: req.RequestFingerprint,
-		Status:             domain.TransactionStatusCommitted,
-		Entries: []domain.JournalEntry{
-			{ID: uuid.New(), TransactionID: txID, AccountID: req.FromAccountID, Amount: req.Amount.Neg(), Currency: req.Currency, CreatedAt: now},
-			{ID: uuid.New(), TransactionID: txID, AccountID: req.ToAccountID, Amount: req.Amount, Currency: req.Currency, CreatedAt: now},
-		},
-		CreatedAt: now,
-	}
-	if err := tx.AssertBalanced(); err != nil {
-		return nil, err
-	}
-	f.txByID[txID] = tx
-	f.txByIdem[bucket] = tx
-	return tx, nil
-}
-func (f *fakeLedgerRepo) GetTransaction(_ context.Context, id uuid.UUID) (*domain.Transaction, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	tx, ok := f.txByID[id]
-	if !ok {
-		return nil, domain.ErrTransactionNotFound
-	}
-	return tx, nil
-}
-func (f *fakeLedgerRepo) GetTransactionByIdempotencyKey(_ context.Context, tenantID, key string) (*domain.Transaction, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	tx, ok := f.txByIdem[idemBucketKey(tenantID, key)]
-	if !ok {
-		return nil, domain.ErrTransactionNotFound
-	}
-	return tx, nil
-}
-
-// ---------------------------------------------------------------------------
-// Test harness — bufconn-backed gRPC server + client.
-// ---------------------------------------------------------------------------
-
 const bufSize = 1024 * 1024
 
 type harness struct {
 	client pb.LedgerServiceClient
-	idem   *fakeIdemStore
-	repo   *fakeLedgerRepo
+	idem   *mocks.MockIdempotencyStore
+	repo   *mocks.MockLedgerRepository
 	stop   func()
 }
 
 func newHarness(t *testing.T) *harness {
 	t.Helper()
-	idem := newFakeIdem()
-	repo := newFakeRepo()
-	uc := usecase.NewTransferUsecase(repo, idem, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	handler := transportgrpc.NewLedgerHandler(uc, repo, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	ctrl := gomock.NewController(t)
+	idem := mocks.NewMockIdempotencyStore(ctrl)
+	repo := mocks.NewMockLedgerRepository(ctrl)
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	uc := usecase.NewTransferUsecase(repo, idem, logger)
+	handler := transportgrpc.NewLedgerHandler(uc, repo, logger)
 
 	lis := bufconn.Listen(bufSize)
 	srv := gogrpc.NewServer(gogrpc.UnaryInterceptor(injectTestClaims))
@@ -187,95 +89,101 @@ func newHarness(t *testing.T) *harness {
 
 func validTransferReq() *pb.TransferRequest {
 	return &pb.TransferRequest{
-		IdempotencyKey: "k1",
-		FromAccountId:  "11111111-1111-1111-1111-111111111111",
-		ToAccountId:    "22222222-2222-2222-2222-222222222222",
+		IdempotencyKey: testIdemKey,
+		FromAccountId:  testFromAccount,
+		ToAccountId:    testToAccount,
 		Amount:         "100.0000",
 		Currency:       "USD",
 	}
 }
 
-// validTransferFingerprint returns the canonical fingerprint of the
-// validTransferReq() body as the production handler would compute it
-// (after parsing the proto). Test setups use this to seed the fake
-// idempotency store with a fingerprint that matches the request the
-// test will send — otherwise the mismatch path fires.
+// validTransferFingerprint is the canonical fingerprint of validTransferReq()
+// the production handler computes after parsing the proto.
 func validTransferFingerprint() string {
 	return usecase.TransferFingerprint(usecase.TransferInput{
 		TenantID:       testTenant,
-		IdempotencyKey: "k1",
-		FromAccountID:  uuid.MustParse("11111111-1111-1111-1111-111111111111"),
-		ToAccountID:    uuid.MustParse("22222222-2222-2222-2222-222222222222"),
-		Amount:         decimal.NewFromFloat(100.0),
+		IdempotencyKey: testIdemKey,
+		FromAccountID:  uuid.MustParse(testFromAccount),
+		ToAccountID:    uuid.MustParse(testToAccount),
+		Amount:         decimal.NewFromInt(100),
 		Currency:       "USD",
 	})
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
+func seededTx(t *testing.T, fp string) *domain.Transaction {
+	t.Helper()
+	now := time.Now().UTC()
+	txID := uuid.New()
+	return &domain.Transaction{
+		ID:                 txID,
+		TenantID:           testTenant,
+		IdempotencyKey:     testIdemKey,
+		RequestFingerprint: fp,
+		Status:             domain.TransactionStatusCommitted,
+		Entries: []domain.JournalEntry{
+			{ID: uuid.New(), TransactionID: txID, Amount: decimal.NewFromInt(-100), Currency: "USD", CreatedAt: now},
+			{ID: uuid.New(), TransactionID: txID, Amount: decimal.NewFromInt(100), Currency: "USD", CreatedAt: now},
+		},
+		CreatedAt: now,
+	}
+}
 
 func TestLedgerHandler_Transfer(t *testing.T) {
 	cases := []struct {
-		name     string
-		setup    func(*harness)
-		mutate   func(*pb.TransferRequest)
-		wantCode codes.Code
+		name         string
+		mutate       func(*pb.TransferRequest)
+		expect       func(t *testing.T, h *harness, fp string)
+		wantCode     codes.Code
 		wantReplayed bool
 	}{
 		{
-			name:     "happy path returns OK with replayed=false",
+			name: "happy path returns OK with replayed=false",
+			expect: func(t *testing.T, h *harness, fp string) {
+				gomock.InOrder(
+					h.idem.EXPECT().Acquire(gomock.Any(), testScopedKey, fp).
+						Return(true, domain.IdempotencyRecord{}, nil),
+					h.repo.EXPECT().ExecuteTransfer(gomock.Any(), gomock.Any()).
+						Return(seededTx(t, fp), nil),
+					h.idem.EXPECT().SetState(gomock.Any(), testScopedKey, fp, domain.IdempotencyCompleted).
+						Return(nil),
+				)
+			},
 			wantCode: codes.OK,
 		},
 		{
 			name: "replay path returns OK with replayed=true",
-			setup: func(h *harness) {
-				fp := validTransferFingerprint()
-				now := time.Now().UTC()
-				txID := uuid.New()
-				h.repo.seed(&domain.Transaction{
-					ID:                 txID,
-					TenantID:           testTenant,
-					IdempotencyKey:     "k1",
-					RequestFingerprint: fp,
-					Status:             domain.TransactionStatusCommitted,
-					Entries: []domain.JournalEntry{
-						{ID: uuid.New(), TransactionID: txID, Amount: decimal.NewFromInt(-100), Currency: "USD", CreatedAt: now},
-						{ID: uuid.New(), TransactionID: txID, Amount: decimal.NewFromInt(100), Currency: "USD", CreatedAt: now},
-					},
-					CreatedAt: now,
-				})
-				h.idem.records[testTenant+":k1"] = domain.IdempotencyRecord{
-					State: domain.IdempotencyCompleted, Fingerprint: fp,
-				}
+			expect: func(t *testing.T, h *harness, fp string) {
+				gomock.InOrder(
+					h.idem.EXPECT().Acquire(gomock.Any(), testScopedKey, fp).
+						Return(false, domain.IdempotencyRecord{State: domain.IdempotencyCompleted, Fingerprint: fp}, nil),
+					h.repo.EXPECT().GetTransactionByIdempotencyKey(gomock.Any(), testTenant, testIdemKey).
+						Return(seededTx(t, fp), nil),
+				)
 			},
 			wantCode:     codes.OK,
 			wantReplayed: true,
 		},
 		{
 			name: "STARTED state -> Aborted",
-			setup: func(h *harness) {
-				h.idem.records[testTenant+":k1"] = domain.IdempotencyRecord{
-					State: domain.IdempotencyStarted, Fingerprint: validTransferFingerprint(),
-				}
+			expect: func(t *testing.T, h *harness, fp string) {
+				h.idem.EXPECT().Acquire(gomock.Any(), testScopedKey, fp).
+					Return(false, domain.IdempotencyRecord{State: domain.IdempotencyStarted, Fingerprint: fp}, nil)
 			},
 			wantCode: codes.Aborted,
 		},
 		{
 			name: "FAILED state -> AlreadyExists",
-			setup: func(h *harness) {
-				h.idem.records[testTenant+":k1"] = domain.IdempotencyRecord{
-					State: domain.IdempotencyFailed, Fingerprint: validTransferFingerprint(),
-				}
+			expect: func(t *testing.T, h *harness, fp string) {
+				h.idem.EXPECT().Acquire(gomock.Any(), testScopedKey, fp).
+					Return(false, domain.IdempotencyRecord{State: domain.IdempotencyFailed, Fingerprint: fp}, nil)
 			},
 			wantCode: codes.AlreadyExists,
 		},
 		{
 			name: "fingerprint mismatch on completed -> FailedPrecondition",
-			setup: func(h *harness) {
-				h.idem.records[testTenant+":k1"] = domain.IdempotencyRecord{
-					State: domain.IdempotencyCompleted, Fingerprint: "stale-prior-request-fp",
-				}
+			expect: func(t *testing.T, h *harness, fp string) {
+				h.idem.EXPECT().Acquire(gomock.Any(), testScopedKey, fp).
+					Return(false, domain.IdempotencyRecord{State: domain.IdempotencyCompleted, Fingerprint: "stale-fp"}, nil)
 			},
 			wantCode: codes.FailedPrecondition,
 		},
@@ -301,15 +209,16 @@ func TestLedgerHandler_Transfer(t *testing.T) {
 			h := newHarness(t)
 			defer h.stop()
 
-			if tc.setup != nil {
-				tc.setup(h)
+			fp := validTransferFingerprint()
+			if tc.expect != nil {
+				tc.expect(t, h, fp)
 			}
 			req := validTransferReq()
 			if tc.mutate != nil {
 				tc.mutate(req)
 			}
 
-			resp, err := h.client.Transfer(context.Background(), req)
+			resp, err := h.client.Transfer(t.Context(), req)
 			if tc.wantCode == codes.OK {
 				require.NoError(t, err)
 				require.NotNil(t, resp)
@@ -331,22 +240,14 @@ func TestLedgerHandler_GetTransaction(t *testing.T) {
 	h := newHarness(t)
 	defer h.stop()
 
-	now := time.Now().UTC()
 	txID := uuid.New()
-	h.repo.seed(&domain.Transaction{
-		ID:             txID,
-		TenantID:       testTenant,
-		IdempotencyKey: "seeded",
-		Status:         domain.TransactionStatusCommitted,
-		Entries: []domain.JournalEntry{
-			{ID: uuid.New(), TransactionID: txID, Amount: decimal.NewFromInt(-50), Currency: "USD", CreatedAt: now},
-			{ID: uuid.New(), TransactionID: txID, Amount: decimal.NewFromInt(50), Currency: "USD", CreatedAt: now},
-		},
-		CreatedAt: now,
-	})
+	seeded := seededTx(t, validTransferFingerprint())
+	seeded.ID = txID
 
 	t.Run("success", func(t *testing.T) {
-		resp, err := h.client.GetTransaction(context.Background(), &pb.GetTransactionRequest{Id: txID.String()})
+		h.repo.EXPECT().GetTransaction(gomock.Any(), txID).Return(seeded, nil)
+
+		resp, err := h.client.GetTransaction(t.Context(), &pb.GetTransactionRequest{Id: txID.String()})
 		require.NoError(t, err)
 		require.NotNil(t, resp.Transaction)
 		require.Equal(t, txID.String(), resp.Transaction.Id)
@@ -354,14 +255,18 @@ func TestLedgerHandler_GetTransaction(t *testing.T) {
 	})
 
 	t.Run("invalid uuid -> InvalidArgument", func(t *testing.T) {
-		_, err := h.client.GetTransaction(context.Background(), &pb.GetTransactionRequest{Id: "bad"})
+		_, err := h.client.GetTransaction(t.Context(), &pb.GetTransactionRequest{Id: "bad"})
 		require.Error(t, err)
 		st, _ := status.FromError(err)
 		require.Equal(t, codes.InvalidArgument, st.Code())
 	})
 
 	t.Run("missing tx -> NotFound", func(t *testing.T) {
-		_, err := h.client.GetTransaction(context.Background(), &pb.GetTransactionRequest{Id: uuid.New().String()})
+		missingID := uuid.New()
+		h.repo.EXPECT().GetTransaction(gomock.Any(), missingID).
+			Return(nil, domain.ErrTransactionNotFound)
+
+		_, err := h.client.GetTransaction(t.Context(), &pb.GetTransactionRequest{Id: missingID.String()})
 		require.Error(t, err)
 		st, _ := status.FromError(err)
 		require.Equal(t, codes.NotFound, st.Code())
@@ -373,26 +278,15 @@ func TestLedgerHandler_Transfer_TrailerOnReplay(t *testing.T) {
 	defer h.stop()
 
 	fp := validTransferFingerprint()
-	now := time.Now().UTC()
-	txID := uuid.New()
-	h.repo.seed(&domain.Transaction{
-		ID:                 txID,
-		TenantID:           testTenant,
-		IdempotencyKey:     "k1",
-		RequestFingerprint: fp,
-		Status:             domain.TransactionStatusCommitted,
-		Entries: []domain.JournalEntry{
-			{ID: uuid.New(), TransactionID: txID, Amount: decimal.NewFromInt(-100), Currency: "USD", CreatedAt: now},
-			{ID: uuid.New(), TransactionID: txID, Amount: decimal.NewFromInt(100), Currency: "USD", CreatedAt: now},
-		},
-		CreatedAt: now,
-	})
-	h.idem.records[testTenant+":k1"] = domain.IdempotencyRecord{
-		State: domain.IdempotencyCompleted, Fingerprint: fp,
-	}
+	gomock.InOrder(
+		h.idem.EXPECT().Acquire(gomock.Any(), testScopedKey, fp).
+			Return(false, domain.IdempotencyRecord{State: domain.IdempotencyCompleted, Fingerprint: fp}, nil),
+		h.repo.EXPECT().GetTransactionByIdempotencyKey(gomock.Any(), testTenant, testIdemKey).
+			Return(seededTx(t, fp), nil),
+	)
 
 	var trailer metadata.MD
-	resp, err := h.client.Transfer(context.Background(), validTransferReq(), gogrpc.Trailer(&trailer))
+	resp, err := h.client.Transfer(t.Context(), validTransferReq(), gogrpc.Trailer(&trailer))
 	require.NoError(t, err)
 	require.True(t, resp.Replayed)
 	require.Equal(t, []string{"true"}, trailer.Get(transportgrpc.MetadataKeyReplayed),
