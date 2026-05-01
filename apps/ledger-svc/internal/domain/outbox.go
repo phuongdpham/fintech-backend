@@ -32,18 +32,24 @@ const (
 )
 
 // OutboxEvent is the row written atomically alongside ledger mutations and
-// later relayed to Kafka by the Outbox Worker. Payload is opaque JSON to
-// the domain — the producer chooses the schema.
+// later relayed to Kafka by the Outbox Worker.
+//
+// Payload holds proto-serialized event bytes (BYTEA in Postgres). EventSchema
+// names the proto message (e.g. "fintech.ledger.v1.TransferCommittedV1") so
+// consumers can route without parsing payload first. Payload is opaque to
+// the domain — the producer chooses the schema; the worker forwards bytes
+// to Kafka without re-encoding.
 type OutboxEvent struct {
 	ID            uuid.UUID
 	AggregateType AggregateType
 	AggregateID   uuid.UUID
+	EventSchema   string
 	Payload       []byte
 	Status        OutboxStatus
 	CreatedAt     time.Time
 }
 
-func NewOutboxEvent(id, aggregateID uuid.UUID, aggType AggregateType, payload []byte, createdAt time.Time) (*OutboxEvent, error) {
+func NewOutboxEvent(id, aggregateID uuid.UUID, aggType AggregateType, schema string, payload []byte, createdAt time.Time) (*OutboxEvent, error) {
 	if aggType == "" {
 		return nil, ErrInvalidOutboxStatus
 	}
@@ -54,6 +60,7 @@ func NewOutboxEvent(id, aggregateID uuid.UUID, aggType AggregateType, payload []
 		ID:            id,
 		AggregateType: aggType,
 		AggregateID:   aggregateID,
+		EventSchema:   schema,
 		Payload:       payload,
 		Status:        OutboxStatusPending,
 		CreatedAt:     createdAt,

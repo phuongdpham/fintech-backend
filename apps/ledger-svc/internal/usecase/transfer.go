@@ -196,6 +196,7 @@ func (u *TransferUsecase) executeAndReplayOnDup(ctx context.Context, in Transfer
 		ToAccountID:        in.ToAccountID,
 		Amount:             in.Amount,
 		Currency:           in.Currency,
+		OutboxSchema:       SchemaTransferCommittedV1,
 		OutboxPayload:      payload,
 		AuditEnvelope:      envelope,
 	}

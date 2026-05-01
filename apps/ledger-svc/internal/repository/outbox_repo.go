@@ -46,7 +46,7 @@ func NewOutboxRepo(pool *pgxpool.Pool, acquireCfg PoolConfig, metrics AcquireMet
 
 const (
 	selectPendingForUpdateSQL = `
-		SELECT id, aggregate_type, aggregate_id, payload, status, created_at
+		SELECT id, aggregate_type, aggregate_id, event_schema, payload, status, created_at
 		FROM outbox_events
 		WHERE status = 'PENDING'
 		ORDER BY created_at
@@ -54,7 +54,7 @@ const (
 		FOR UPDATE SKIP LOCKED`
 
 	selectStalePendingForUpdateSQL = `
-		SELECT id, aggregate_type, aggregate_id, payload, status, created_at
+		SELECT id, aggregate_type, aggregate_id, event_schema, payload, status, created_at
 		FROM outbox_events
 		WHERE status = 'PENDING' AND created_at < $1
 		ORDER BY created_at
@@ -129,7 +129,7 @@ func (r *OutboxRepo) drain(ctx context.Context, selectSQL string, args []any, pu
 	for rows.Next() {
 		e := &domain.OutboxEvent{}
 		var aggType, statusStr string
-		if err := rows.Scan(&e.ID, &aggType, &e.AggregateID, &e.Payload, &statusStr, &e.CreatedAt); err != nil {
+		if err := rows.Scan(&e.ID, &aggType, &e.AggregateID, &e.EventSchema, &e.Payload, &statusStr, &e.CreatedAt); err != nil {
 			rows.Close()
 			return 0, fmt.Errorf("repository: scan pending: %w", err)
 		}

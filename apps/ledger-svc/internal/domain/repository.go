@@ -32,6 +32,12 @@ type TransferRequest struct {
 	ToAccountID        uuid.UUID
 	Amount             Amount
 	Currency           Currency
+	// OutboxSchema names the proto message embedded in OutboxPayload
+	// (e.g. "fintech.ledger.v1.TransferCommittedV1"). Stored on the
+	// outbox row so consumers can route without parsing payload first.
+	OutboxSchema       string
+	// OutboxPayload is the proto-serialized event bytes. Worker
+	// forwards to Kafka without re-encoding.
 	OutboxPayload      []byte
 	// AuditEnvelope is sourced from request context (Claims, RequestID,
 	// trace_id) by the usecase. The repo writes the audit row in the

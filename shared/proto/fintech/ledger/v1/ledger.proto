@@ -75,3 +75,20 @@ service LedgerService {
   rpc Transfer       (TransferRequest)       returns (TransferResponse);
   rpc GetTransaction (GetTransactionRequest) returns (GetTransactionResponse);
 }
+
+// TransferCommittedV1 is the outbox payload for a successful transfer.
+// Stored as proto-serialized bytes in outbox_events.payload (BYTEA),
+// forwarded to Kafka without re-encoding. Schema-versioned via the
+// message name; consumers add a TransferCommittedV2 on schema break,
+// never modify V1.
+//
+// Amount is a decimal-as-string at NUMERIC(19,4) scale to preserve
+// precision across language runtimes that lack a decimal type.
+message TransferCommittedV1 {
+  string tenant_id       = 1;
+  string idempotency_key = 2;
+  string from_account_id = 3;
+  string to_account_id   = 4;
+  string amount          = 5;
+  string currency        = 6;
+}

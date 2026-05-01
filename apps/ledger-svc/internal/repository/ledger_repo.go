@@ -73,8 +73,8 @@ const (
 		VALUES ($1, $2, $3, $4, $5, $6, $7)`
 
 	insertOutboxEventSQL = `
-		INSERT INTO outbox_events (id, aggregate_type, aggregate_id, payload, status, created_at)
-		VALUES ($1, $2, $3, $4, $5, $6)`
+		INSERT INTO outbox_events (id, aggregate_type, aggregate_id, event_schema, payload, status, created_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7)`
 
 	selectTransactionSQL = `
 		SELECT id, tenant_id, idempotency_key, request_fingerprint, status, created_at
@@ -196,7 +196,7 @@ func (r *LedgerRepo) ExecuteTransfer(ctx context.Context, req domain.TransferReq
 
 		if _, err := tx.Exec(ctx, insertOutboxEventSQL,
 			outboxID, string(domain.AggregateTypeTransaction),
-			transaction.ID, req.OutboxPayload,
+			transaction.ID, req.OutboxSchema, req.OutboxPayload,
 			string(domain.OutboxStatusPending), now,
 		); err != nil {
 			return fmt.Errorf("insert outbox event: %w", err)

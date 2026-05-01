@@ -425,6 +425,98 @@ func (x *GetTransactionResponse) GetTransaction() *Transaction {
 	return nil
 }
 
+// TransferCommittedV1 is the outbox payload for a successful transfer.
+// Stored as proto-serialized bytes in outbox_events.payload (BYTEA),
+// forwarded to Kafka without re-encoding. Schema-versioned via the
+// message name; consumers add a TransferCommittedV2 on schema break,
+// never modify V1.
+//
+// Amount is a decimal-as-string at NUMERIC(19,4) scale to preserve
+// precision across language runtimes that lack a decimal type.
+type TransferCommittedV1 struct {
+	state          protoimpl.MessageState `protogen:"open.v1"`
+	TenantId       string                 `protobuf:"bytes,1,opt,name=tenant_id,json=tenantId,proto3" json:"tenant_id,omitempty"`
+	IdempotencyKey string                 `protobuf:"bytes,2,opt,name=idempotency_key,json=idempotencyKey,proto3" json:"idempotency_key,omitempty"`
+	FromAccountId  string                 `protobuf:"bytes,3,opt,name=from_account_id,json=fromAccountId,proto3" json:"from_account_id,omitempty"`
+	ToAccountId    string                 `protobuf:"bytes,4,opt,name=to_account_id,json=toAccountId,proto3" json:"to_account_id,omitempty"`
+	Amount         string                 `protobuf:"bytes,5,opt,name=amount,proto3" json:"amount,omitempty"`
+	Currency       string                 `protobuf:"bytes,6,opt,name=currency,proto3" json:"currency,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
+}
+
+func (x *TransferCommittedV1) Reset() {
+	*x = TransferCommittedV1{}
+	mi := &file_fintech_ledger_v1_ledger_proto_msgTypes[6]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *TransferCommittedV1) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*TransferCommittedV1) ProtoMessage() {}
+
+func (x *TransferCommittedV1) ProtoReflect() protoreflect.Message {
+	mi := &file_fintech_ledger_v1_ledger_proto_msgTypes[6]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use TransferCommittedV1.ProtoReflect.Descriptor instead.
+func (*TransferCommittedV1) Descriptor() ([]byte, []int) {
+	return file_fintech_ledger_v1_ledger_proto_rawDescGZIP(), []int{6}
+}
+
+func (x *TransferCommittedV1) GetTenantId() string {
+	if x != nil {
+		return x.TenantId
+	}
+	return ""
+}
+
+func (x *TransferCommittedV1) GetIdempotencyKey() string {
+	if x != nil {
+		return x.IdempotencyKey
+	}
+	return ""
+}
+
+func (x *TransferCommittedV1) GetFromAccountId() string {
+	if x != nil {
+		return x.FromAccountId
+	}
+	return ""
+}
+
+func (x *TransferCommittedV1) GetToAccountId() string {
+	if x != nil {
+		return x.ToAccountId
+	}
+	return ""
+}
+
+func (x *TransferCommittedV1) GetAmount() string {
+	if x != nil {
+		return x.Amount
+	}
+	return ""
+}
+
+func (x *TransferCommittedV1) GetCurrency() string {
+	if x != nil {
+		return x.Currency
+	}
+	return ""
+}
+
 var File_fintech_ledger_v1_ledger_proto protoreflect.FileDescriptor
 
 const file_fintech_ledger_v1_ledger_proto_rawDesc = "" +
@@ -458,7 +550,14 @@ const file_fintech_ledger_v1_ledger_proto_rawDesc = "" +
 	"\x15GetTransactionRequest\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\"Z\n" +
 	"\x16GetTransactionResponse\x12@\n" +
-	"\vtransaction\x18\x01 \x01(\v2\x1e.fintech.ledger.v1.TransactionR\vtransaction2\xcb\x01\n" +
+	"\vtransaction\x18\x01 \x01(\v2\x1e.fintech.ledger.v1.TransactionR\vtransaction\"\xdb\x01\n" +
+	"\x13TransferCommittedV1\x12\x1b\n" +
+	"\ttenant_id\x18\x01 \x01(\tR\btenantId\x12'\n" +
+	"\x0fidempotency_key\x18\x02 \x01(\tR\x0eidempotencyKey\x12&\n" +
+	"\x0ffrom_account_id\x18\x03 \x01(\tR\rfromAccountId\x12\"\n" +
+	"\rto_account_id\x18\x04 \x01(\tR\vtoAccountId\x12\x16\n" +
+	"\x06amount\x18\x05 \x01(\tR\x06amount\x12\x1a\n" +
+	"\bcurrency\x18\x06 \x01(\tR\bcurrency2\xcb\x01\n" +
 	"\rLedgerService\x12S\n" +
 	"\bTransfer\x12\".fintech.ledger.v1.TransferRequest\x1a#.fintech.ledger.v1.TransferResponse\x12e\n" +
 	"\x0eGetTransaction\x12(.fintech.ledger.v1.GetTransactionRequest\x1a).fintech.ledger.v1.GetTransactionResponseB\xd7\x01\n" +
@@ -476,7 +575,7 @@ func file_fintech_ledger_v1_ledger_proto_rawDescGZIP() []byte {
 	return file_fintech_ledger_v1_ledger_proto_rawDescData
 }
 
-var file_fintech_ledger_v1_ledger_proto_msgTypes = make([]protoimpl.MessageInfo, 6)
+var file_fintech_ledger_v1_ledger_proto_msgTypes = make([]protoimpl.MessageInfo, 7)
 var file_fintech_ledger_v1_ledger_proto_goTypes = []any{
 	(*JournalEntry)(nil),           // 0: fintech.ledger.v1.JournalEntry
 	(*Transaction)(nil),            // 1: fintech.ledger.v1.Transaction
@@ -484,12 +583,13 @@ var file_fintech_ledger_v1_ledger_proto_goTypes = []any{
 	(*TransferResponse)(nil),       // 3: fintech.ledger.v1.TransferResponse
 	(*GetTransactionRequest)(nil),  // 4: fintech.ledger.v1.GetTransactionRequest
 	(*GetTransactionResponse)(nil), // 5: fintech.ledger.v1.GetTransactionResponse
-	(*timestamppb.Timestamp)(nil),  // 6: google.protobuf.Timestamp
+	(*TransferCommittedV1)(nil),    // 6: fintech.ledger.v1.TransferCommittedV1
+	(*timestamppb.Timestamp)(nil),  // 7: google.protobuf.Timestamp
 }
 var file_fintech_ledger_v1_ledger_proto_depIdxs = []int32{
-	6, // 0: fintech.ledger.v1.JournalEntry.created_at:type_name -> google.protobuf.Timestamp
+	7, // 0: fintech.ledger.v1.JournalEntry.created_at:type_name -> google.protobuf.Timestamp
 	0, // 1: fintech.ledger.v1.Transaction.entries:type_name -> fintech.ledger.v1.JournalEntry
-	6, // 2: fintech.ledger.v1.Transaction.created_at:type_name -> google.protobuf.Timestamp
+	7, // 2: fintech.ledger.v1.Transaction.created_at:type_name -> google.protobuf.Timestamp
 	1, // 3: fintech.ledger.v1.TransferResponse.transaction:type_name -> fintech.ledger.v1.Transaction
 	1, // 4: fintech.ledger.v1.GetTransactionResponse.transaction:type_name -> fintech.ledger.v1.Transaction
 	2, // 5: fintech.ledger.v1.LedgerService.Transfer:input_type -> fintech.ledger.v1.TransferRequest
@@ -514,7 +614,7 @@ func file_fintech_ledger_v1_ledger_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_fintech_ledger_v1_ledger_proto_rawDesc), len(file_fintech_ledger_v1_ledger_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   6,
+			NumMessages:   7,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

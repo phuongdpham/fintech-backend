@@ -140,11 +140,19 @@ END $$;
 -- Transactional Outbox — atomically committed alongside ledger writes,
 -- drained by the Outbox Relay Worker. Decouples DB durability from
 -- Kafka availability and gives at-least-once delivery semantics.
+--
+-- payload is BYTEA holding proto-serialized event bytes (schema name
+-- in event_schema). The worker forwards bytes to Kafka without
+-- re-encoding — a marshal/parse cycle eliminated on the hot path.
+-- JSONB queryability is the cost; for outbox where we only read by
+-- (status, created_at) and never WHERE payload->>'type', the throughput
+-- argument wins at 10K TPS.
 CREATE TABLE outbox_events (
     id             UUID         PRIMARY KEY DEFAULT uuidv7(),
     aggregate_type VARCHAR(50)  NOT NULL,
     aggregate_id   UUID         NOT NULL,
-    payload        JSONB        NOT NULL,
+    event_schema   VARCHAR(80)  NOT NULL,
+    payload        BYTEA        NOT NULL,
     status         VARCHAR(20)  NOT NULL DEFAULT 'PENDING'
                                 CHECK (status IN ('PENDING', 'PUBLISHED')),
     created_at     TIMESTAMPTZ  NOT NULL DEFAULT NOW()
