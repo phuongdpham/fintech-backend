@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/shopspring/decimal"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/mock/gomock"
 
@@ -46,7 +45,7 @@ func validInput() usecase.TransferInput {
 		IdempotencyKey: "k1",
 		FromAccountID:  uuid.MustParse("11111111-1111-1111-1111-111111111111"),
 		ToAccountID:    uuid.MustParse("22222222-2222-2222-2222-222222222222"),
-		Amount:         decimal.NewFromInt(100),
+		Amount:         domain.NewAmountFromInt(100),
 		Currency:       "USD",
 	}
 }
@@ -68,8 +67,8 @@ func originalTx(t *testing.T) *domain.Transaction {
 		RequestFingerprint: usecase.TransferFingerprint(validInput()),
 		Status:             domain.TransactionStatusCommitted,
 		Entries: []domain.JournalEntry{
-			{ID: uuid.New(), TransactionID: txID, Amount: decimal.NewFromInt(-100), Currency: "USD"},
-			{ID: uuid.New(), TransactionID: txID, Amount: decimal.NewFromInt(100), Currency: "USD"},
+			{ID: uuid.New(), TransactionID: txID, Amount: domain.NewAmountFromInt(-100), Currency: "USD"},
+			{ID: uuid.New(), TransactionID: txID, Amount: domain.NewAmountFromInt(100), Currency: "USD"},
 		},
 		CreatedAt: time.Now().UTC(),
 	}
@@ -262,11 +261,11 @@ func TestTransferUsecase_Execute(t *testing.T) {
 		},
 		{
 			name: "validation: zero amount rejected pre-port",
-			in:   func() usecase.TransferInput { in := validInput(); in.Amount = decimal.Zero; return in }(),
+			in:   func() usecase.TransferInput { in := validInput(); in.Amount = domain.ZeroAmount(); return in }(),
 		},
 		{
 			name: "validation: negative amount rejected pre-port",
-			in:   func() usecase.TransferInput { in := validInput(); in.Amount = decimal.NewFromInt(-1); return in }(),
+			in:   func() usecase.TransferInput { in := validInput(); in.Amount = domain.NewAmountFromInt(-1); return in }(),
 		},
 		{
 			name: "validation: missing tenant rejected pre-port",
@@ -348,7 +347,7 @@ func TestTransferUsecase_Execute_PreflightBalanceHolds(t *testing.T) {
 	require.NotNil(t, out)
 	require.Len(t, out.Transaction.Entries, 2)
 
-	sum := decimal.Zero
+	sum := domain.ZeroAmount()
 	for _, e := range out.Transaction.Entries {
 		sum = sum.Add(e.Amount)
 	}

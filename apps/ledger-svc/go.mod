@@ -13,6 +13,7 @@ replace github.com/phuongdpham/fintech/libs/go/proto-gen => ../../libs/go/proto-
 require (
 	github.com/KimMachineGun/automemlimit v0.7.5
 	github.com/caarlos0/env/v11 v11.4.0
+	github.com/cockroachdb/apd/v3 v3.2.3
 	github.com/confluentinc/confluent-kafka-go/v2 v2.14.1
 	github.com/golang-migrate/migrate/v4 v4.19.1
 	github.com/google/uuid v1.6.0
@@ -21,7 +22,6 @@ require (
 	github.com/prometheus/client_golang v1.23.2
 	github.com/prometheus/client_model v0.6.2
 	github.com/redis/go-redis/v9 v9.18.0
-	github.com/shopspring/decimal v1.4.0
 	github.com/stretchr/testify v1.11.1
 	go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc v0.68.0
 	go.opentelemetry.io/otel v1.43.0

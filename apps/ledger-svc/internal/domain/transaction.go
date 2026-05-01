@@ -4,7 +4,6 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/shopspring/decimal"
 )
 
 type TransactionStatus string
@@ -63,7 +62,7 @@ func (t *Transaction) AssertBalanced() error {
 	if len(t.Entries) < 2 {
 		return ErrUnbalancedTransaction
 	}
-	sum := decimal.Zero
+	sum := ZeroAmount()
 	for i := range t.Entries {
 		sum = sum.Add(t.Entries[i].Amount)
 	}

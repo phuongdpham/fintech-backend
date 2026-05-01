@@ -6,7 +6,6 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/shopspring/decimal"
 	"github.com/stretchr/testify/require"
 
 	"github.com/phuongdpham/fintech/apps/ledger-svc/internal/domain"
@@ -17,13 +16,17 @@ import (
 // integration tests.
 func TestTransaction_AssertBalanced(t *testing.T) {
 	now := time.Now().UTC()
-	dec := func(s string) decimal.Decimal { return decimal.RequireFromString(s) }
+	amt := func(s string) domain.Amount {
+		a, err := domain.NewAmount(s)
+		require.NoError(t, err)
+		return a
+	}
 	leg := func(amount string) domain.JournalEntry {
 		return domain.JournalEntry{
 			ID:            uuid.New(),
 			TransactionID: uuid.New(),
 			AccountID:     uuid.New(),
-			Amount:        dec(amount),
+			Amount:        amt(amount),
 			Currency:      "USD",
 			CreatedAt:     now,
 		}

@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/shopspring/decimal"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/mock/gomock"
 	gogrpc "google.golang.org/grpc"
@@ -107,7 +106,7 @@ func validTransferFingerprint() string {
 		IdempotencyKey: testIdemKey,
 		FromAccountID:  uuid.MustParse(testFromAccount),
 		ToAccountID:    uuid.MustParse(testToAccount),
-		Amount:         decimal.NewFromInt(100),
+		Amount:         domain.NewAmountFromInt(100),
 		Currency:       "USD",
 	})
 }
@@ -123,8 +122,8 @@ func seededTx(t *testing.T, fp string) *domain.Transaction {
 		RequestFingerprint: fp,
 		Status:             domain.TransactionStatusCommitted,
 		Entries: []domain.JournalEntry{
-			{ID: uuid.New(), TransactionID: txID, Amount: decimal.NewFromInt(-100), Currency: "USD", CreatedAt: now},
-			{ID: uuid.New(), TransactionID: txID, Amount: decimal.NewFromInt(100), Currency: "USD", CreatedAt: now},
+			{ID: uuid.New(), TransactionID: txID, Amount: domain.NewAmountFromInt(-100), Currency: "USD", CreatedAt: now},
+			{ID: uuid.New(), TransactionID: txID, Amount: domain.NewAmountFromInt(100), Currency: "USD", CreatedAt: now},
 		},
 		CreatedAt: now,
 	}

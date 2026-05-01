@@ -2,7 +2,6 @@ package grpc
 
 import (
 	"github.com/google/uuid"
-	"github.com/shopspring/decimal"
 	"google.golang.org/genproto/googleapis/rpc/errdetails"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -25,12 +24,12 @@ func parseUUID(field, raw string) (uuid.UUID, error) {
 	return id, nil
 }
 
-func parseDecimal(field, raw string) (decimal.Decimal, error) {
-	d, err := decimal.NewFromString(raw)
+func parseAmount(field, raw string) (domain.Amount, error) {
+	a, err := domain.NewAmount(raw)
 	if err != nil {
-		return decimal.Zero, fieldViolation(field, "must be a decimal string (e.g. \"100.0000\")")
+		return domain.Amount{}, fieldViolation(field, "must be a decimal string (e.g. \"100.0000\")")
 	}
-	return d, nil
+	return a, nil
 }
 
 // transferRequestFromPB validates and converts the pb input to the
@@ -48,7 +47,7 @@ func transferRequestFromPB(req *pb.TransferRequest) (usecase.TransferInput, erro
 	if err != nil {
 		return usecase.TransferInput{}, err
 	}
-	amount, err := parseDecimal("amount", req.GetAmount())
+	amount, err := parseAmount("amount", req.GetAmount())
 	if err != nil {
 		return usecase.TransferInput{}, err
 	}
