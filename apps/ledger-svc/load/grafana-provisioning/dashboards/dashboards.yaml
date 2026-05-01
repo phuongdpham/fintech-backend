@@ -1,0 +1,12 @@
+apiVersion: 1
+
+providers:
+  - name: load
+    orgId: 1
+    folder: ledger-svc-load
+    type: file
+    disableDeletion: false
+    editable: true
+    allowUiUpdates: true
+    options:
+      path: /var/lib/grafana/dashboards

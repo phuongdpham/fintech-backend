@@ -94,6 +94,42 @@ run-server: $(LEDGER_BIN)  ## Run the gRPC server (foreground; ctrl-c to stop)
 run-reconciler: $(RECON_BIN)  ## Run the reconciler daemon (foreground)
 	cd $(ROOT) && $(RECON_BIN) --interval 1m
 
+##@ Load test
+# Hybrid topology: Go binary seeds + writes fixtures; k6 drives load.
+# See apps/ledger-svc/load/README.md for the full flow.
+LOADTEST_BIN  := $(DIST)/loadtest
+FIXTURES_PATH := $(SVC_DIR)/load/fixtures.json
+SEED_TENANTS  ?= 1000
+SEED_ACCOUNTS ?= 100
+
+.PHONY: loadtest-build
+loadtest-build: $(LOADTEST_BIN)  ## Build the seed/fixtures binary
+
+.PHONY: loadtest-seed
+loadtest-seed: $(LOADTEST_BIN)  ## Seed accounts and emit fixtures.json (idempotent)
+	$(LOADTEST_BIN) seed \
+		-dsn "$(DATABASE_URL)" \
+		-tenants $(SEED_TENANTS) \
+		-accounts-per-tenant $(SEED_ACCOUNTS) \
+		-fixtures $(FIXTURES_PATH)
+
+.PHONY: loadtest-infra-up
+loadtest-infra-up:  ## Bring up Prometheus + Grafana sidecar (ports 9091, 3001)
+	docker compose -f $(SVC_DIR)/load/docker-compose.yml up -d
+
+.PHONY: loadtest-infra-down
+loadtest-infra-down:  ## Tear down the sidecar stack
+	docker compose -f $(SVC_DIR)/load/docker-compose.yml down
+
+.PHONY: loadtest-run
+loadtest-run:  ## Run the k6 scenario (requires k6 + loadtest-seed first)
+	cd $(ROOT) && K6_PROMETHEUS_RW_SERVER_URL=http://localhost:9091/api/v1/write \
+		k6 run -o experimental-prometheus-rw \
+		apps/ledger-svc/load/k6/transfer.js \
+		-e FIXTURES=apps/ledger-svc/load/fixtures.json \
+		-e ADDR=$${LOADTEST_ADDR:-localhost:9090} \
+		-e PROTO_DIR=shared/proto
+
 ##@ Smoke
 .PHONY: smoke
 smoke:  ## Print example grpcurl invocations
@@ -121,6 +157,6 @@ smoke:  ## Print example grpcurl invocations
 
 # Implicit binary builds — declared as PHONY so `make` always defers to nx,
 # which has its own up-to-date logic and CGO flag plumbing.
-.PHONY: $(LEDGER_BIN) $(RECON_BIN) $(MIGRATE_BIN)
-$(LEDGER_BIN) $(RECON_BIN) $(MIGRATE_BIN):
+.PHONY: $(LEDGER_BIN) $(RECON_BIN) $(MIGRATE_BIN) $(LOADTEST_BIN)
+$(LEDGER_BIN) $(RECON_BIN) $(MIGRATE_BIN) $(LOADTEST_BIN):
 	cd $(ROOT) && pnpm exec nx run ledger-svc:build

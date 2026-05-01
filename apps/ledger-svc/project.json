@@ -10,7 +10,8 @@
         "commands": [
           "go build -o ../../dist/ledger-svc ./cmd/server",
           "go build -o ../../dist/reconciler ./cmd/reconciler",
-          "go build -o ../../dist/migrate ./cmd/migrate"
+          "go build -o ../../dist/migrate ./cmd/migrate",
+          "go build -o ../../dist/loadtest ./cmd/loadtest"
         ],
         "cwd": "apps/ledger-svc",
         "parallel": false,

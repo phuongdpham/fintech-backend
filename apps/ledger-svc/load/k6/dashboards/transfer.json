@@ -1,0 +1,82 @@
+{
+  "title": "ledger-svc — load run",
+  "uid": "ledger-load-transfer",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "5s",
+  "time": { "from": "now-30m", "to": "now" },
+  "panels": [
+    {
+      "type": "timeseries",
+      "title": "Transfer RPS achieved (k6 client view)",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prom-load" },
+      "targets": [
+        {
+          "expr": "sum(rate(k6_transfer_ok_total[30s])) + sum(rate(k6_transfer_err_total[30s]))",
+          "legendFormat": "issued",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(rate(k6_transfer_ok_total[30s]))",
+          "legendFormat": "ok",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Transfer latency p50/p95/p99 (ms)",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prom-load" },
+      "targets": [
+        {
+          "expr": "k6_transfer_latency_ms{quantile=\"0.5\",kind=\"ok\"}",
+          "legendFormat": "p50",
+          "refId": "A"
+        },
+        {
+          "expr": "k6_transfer_latency_ms{quantile=\"0.95\",kind=\"ok\"}",
+          "legendFormat": "p95",
+          "refId": "B"
+        },
+        {
+          "expr": "k6_transfer_latency_ms{quantile=\"0.99\",kind=\"ok\"}",
+          "legendFormat": "p99",
+          "refId": "C"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Errors by gRPC code",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "datasource": { "type": "prometheus", "uid": "prom-load" },
+      "targets": [
+        {
+          "expr": "sum by (code) (rate(k6_transfer_err_total[30s]))",
+          "legendFormat": "{{code}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "VU utilization",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "datasource": { "type": "prometheus", "uid": "prom-load" },
+      "targets": [
+        {
+          "expr": "k6_vus",
+          "legendFormat": "active",
+          "refId": "A"
+        },
+        {
+          "expr": "k6_vus_max",
+          "legendFormat": "max",
+          "refId": "B"
+        }
+      ]
+    }
+  ]
+}

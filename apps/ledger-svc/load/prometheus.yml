@@ -1,0 +1,23 @@
+# Prometheus config for k6 load runs.
+#
+# k6 pushes via remote-write to /api/v1/write (enabled by
+# --web.enable-remote-write-receiver in docker-compose.yml). Scrapes are
+# limited to the load-infra side; ledger-svc Prometheus scraping lives
+# in the main observability stack.
+
+global:
+  scrape_interval: 5s
+  evaluation_interval: 15s
+
+scrape_configs:
+  # Self-scrape — sanity check.
+  - job_name: prometheus
+    static_configs:
+      - targets: ['localhost:9091']
+
+  # ledger-svc Prometheus endpoint, when one exists. Point at whatever
+  # /metrics port the service exposes (currently none — see issue 2/5/6
+  # for metric instrumentation that follows). Comment out until then.
+  # - job_name: ledger-svc
+  #   static_configs:
+  #     - targets: ['localhost:9000']
