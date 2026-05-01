@@ -79,6 +79,14 @@ func NewPool(ctx context.Context, cfg PoolConfig) (*pgxpool.Pool, error) {
 	return pool, nil
 }
 
+// ErrAcquireTimeout is the sentinel returned when AcquireConn /
+// BeginTxWithAcquire wait past PoolConfig.AcquireTimeout without
+// getting a connection. The transport layer maps it to gRPC
+// ResourceExhausted so retry middleware can behave correctly. Don't
+// compare with errors.Is on context.DeadlineExceeded — the wrapper
+// distinguishes "client gave up" from "we ran out of pool slots."
+var ErrAcquireTimeout = errors.New("repository: pgxpool acquire timeout")
+
 // AcquireMetrics is the subset of observability.Metrics this package
 // needs. Defining it here keeps the import graph one-way — repository
 // has no dependency on the broader observability package.
@@ -137,9 +145,12 @@ func AcquireConn(
 	case err == nil:
 		metrics.ObserveAcquire(elapsed, "ok")
 		return conn, nil
-	case errors.Is(err, context.DeadlineExceeded) && cfg.AcquireTimeout > 0:
+	case errors.Is(err, context.DeadlineExceeded) && cfg.AcquireTimeout > 0 && elapsed >= cfg.AcquireTimeout:
+		// Distinguish "we hit AcquireTimeout" from "caller's ctx fired."
+		// Only the former is a pool-saturation signal; the latter is
+		// the client giving up and propagates as context.DeadlineExceeded.
 		metrics.ObserveAcquire(elapsed, "timeout")
-		return nil, fmt.Errorf("repository: acquire timeout after %s: %w", cfg.AcquireTimeout, err)
+		return nil, fmt.Errorf("%w (after %s)", ErrAcquireTimeout, cfg.AcquireTimeout)
 	default:
 		metrics.ObserveAcquire(elapsed, "err")
 		return nil, err

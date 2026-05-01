@@ -100,6 +100,15 @@ type DBConfig struct {
 	ConnMaxLifetime time.Duration `env:"DATABASE_CONN_MAX_LIFE"    envDefault:"1h"`
 	ConnMaxIdleTime time.Duration `env:"DATABASE_CONN_MAX_IDLE"    envDefault:"30m"`
 	AcquireTimeout  time.Duration `env:"DATABASE_ACQUIRE_TIMEOUT"  envDefault:"500ms"`
+	// WorkerAcquireTimeout governs background workers (outbox drain,
+	// reconciler) that don't have a client-side deadline pressing on
+	// them. 30s is the default — workers should patiently wait for a
+	// slot rather than fail-fast and spam the warning log under load.
+	WorkerAcquireTimeout time.Duration `env:"DATABASE_WORKER_ACQUIRE_TIMEOUT" envDefault:"30s"`
+	// WorkerMaxConns sizes the dedicated outbox-worker pool. Kept
+	// separate from MaxConns so a saturated request path can't starve
+	// the drain — workers always have headroom.
+	WorkerMaxConns int32 `env:"DATABASE_WORKER_MAX_CONNS" envDefault:"16"`
 }
 
 // RedisConfig — idempotency-store coordinates. Required: the SETNX
@@ -200,6 +209,18 @@ func (c *Config) Validate() error {
 		errs = append(errs, fmt.Errorf(
 			"DATABASE_ACQUIRE_TIMEOUT must be in [%s, %s] (got %s)",
 			minAcquireTimeout, maxAcquireTimeout, c.DB.AcquireTimeout))
+	}
+	// Worker acquire is a different role; allow a wider band, just
+	// keep it sane.
+	const maxWorkerAcquire = 5 * time.Minute
+	if c.DB.WorkerAcquireTimeout <= 0 || c.DB.WorkerAcquireTimeout > maxWorkerAcquire {
+		errs = append(errs, fmt.Errorf(
+			"DATABASE_WORKER_ACQUIRE_TIMEOUT must be in (0, %s] (got %s)",
+			maxWorkerAcquire, c.DB.WorkerAcquireTimeout))
+	}
+	if c.DB.WorkerMaxConns < 2 {
+		errs = append(errs, fmt.Errorf(
+			"DATABASE_WORKER_MAX_CONNS must be >= 2 (got %d)", c.DB.WorkerMaxConns))
 	}
 	if c.OTel.Sampler == "traceidratio" || c.OTel.Sampler == "parentbased_traceidratio" {
 		if c.OTel.SamplerArg < 0 || c.OTel.SamplerArg > 1 {

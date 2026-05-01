@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -120,19 +121,29 @@ func (u *TransferUsecase) Execute(ctx context.Context, in TransferInput) (*Trans
 	// (4) Acquired. Run the repository transfer.
 	out, err := u.executeAndReplayOnDup(ctx, in, fingerprint)
 	if err != nil {
-		// (5b) Best-effort failure-state write. Do not surface SetState
-		// errors — the original error is what the caller needs to see.
-		if setErr := u.idem.SetState(ctx, scopedKey, fingerprint, domain.IdempotencyFailed); setErr != nil {
+		// (5b) Best-effort failure-state write on a detached context.
+		// If the request was cancelled (client deadline / disconnect),
+		// the request ctx is already done — using it would propagate
+		// the cancel into Redis and we'd lose the FAILED record. The
+		// PG UNIQUE backstop catches subsequent retries either way,
+		// but Redis-tracked FAILED is the cleaner signal for clients.
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 200*time.Millisecond)
+		if setErr := u.idem.SetState(cleanupCtx, scopedKey, fingerprint, domain.IdempotencyFailed); setErr != nil {
 			u.log.WarnContext(ctx, "failed to mark idempotency state FAILED",
 				slog.String("idempotency_key", in.IdempotencyKey),
 				slog.String("tenant_id", in.TenantID),
 				slog.Any("err", setErr))
 		}
+		cancel()
 		return nil, err
 	}
 
 	// (5a) Mark COMPLETED so subsequent retries hit the replay path.
-	if setErr := u.idem.SetState(ctx, scopedKey, fingerprint, domain.IdempotencyCompleted); setErr != nil {
+	// Same detached-ctx pattern: if the gRPC trailer / response write
+	// is racing with the success path, we still want COMPLETED to
+	// land in Redis so future retries replay rather than redo.
+	cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(ctx), 200*time.Millisecond)
+	if setErr := u.idem.SetState(cleanupCtx, scopedKey, fingerprint, domain.IdempotencyCompleted); setErr != nil {
 		u.log.WarnContext(ctx, "failed to mark idempotency state COMPLETED",
 			slog.String("idempotency_key", in.IdempotencyKey),
 			slog.String("tenant_id", in.TenantID),
@@ -141,6 +152,7 @@ func (u *TransferUsecase) Execute(ctx context.Context, in TransferInput) (*Trans
 		// future replays will fall through to PG's UNIQUE constraint and
 		// recover via the executeAndReplayOnDup path.
 	}
+	cleanupCancel()
 	return out, nil
 }
 

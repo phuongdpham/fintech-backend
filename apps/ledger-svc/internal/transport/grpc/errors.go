@@ -7,6 +7,7 @@
 package grpc
 
 import (
+	"context"
 	"errors"
 	"log/slog"
 
@@ -43,6 +44,17 @@ var errorMapping = []struct {
 	// Repository circuit-open: client should retry after a short delay.
 	// Unavailable matches gRPC's documented "transient backoff" semantics.
 	{repository.ErrCircuitOpen, codes.Unavailable},
+	// Pool starvation. Returning ResourceExhausted (rather than the
+	// generic Internal we used to fall through to) tells the client
+	// "back off and retry", which is honest and lets retry middleware
+	// behave correctly.
+	{repository.ErrAcquireTimeout, codes.ResourceExhausted},
+	// Cancellation propagation. When the client disconnects or hits
+	// its own deadline, ctx.Err() bubbles up through the repo. These
+	// are not server faults — map to the matching gRPC code so the
+	// "unhandled error" log line stops firing.
+	{context.Canceled, codes.Canceled},
+	{context.DeadlineExceeded, codes.DeadlineExceeded},
 }
 
 // asGRPCError translates a domain or wrapped error to a gRPC status error.

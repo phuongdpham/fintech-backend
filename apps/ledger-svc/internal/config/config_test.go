@@ -18,6 +18,8 @@ func clearAll(t *testing.T) {
 		"GRPC_ADDR", "GRPC_SHUTDOWN_TIMEOUT",
 		"DATABASE_URL", "DATABASE_MAX_CONNS", "DATABASE_MIN_CONNS",
 		"DATABASE_CONN_MAX_LIFE", "DATABASE_CONN_MAX_IDLE",
+		"DATABASE_ACQUIRE_TIMEOUT", "DATABASE_WORKER_ACQUIRE_TIMEOUT",
+		"DATABASE_WORKER_MAX_CONNS",
 		"REDIS_URL",
 		"KAFKA_BROKERS", "KAFKA_CLIENT_ID",
 		"OUTBOX_TOPIC", "OUTBOX_WORKERS",
@@ -103,6 +105,8 @@ func TestLoad_Defaults(t *testing.T) {
 		{"DB.MaxConns", cfg.DB.MaxConns, int32(120)},
 		{"DB.MinConns", cfg.DB.MinConns, int32(20)},
 		{"DB.AcquireTimeout", cfg.DB.AcquireTimeout, 500 * time.Millisecond},
+		{"DB.WorkerAcquireTimeout", cfg.DB.WorkerAcquireTimeout, 30 * time.Second},
+		{"DB.WorkerMaxConns", cfg.DB.WorkerMaxConns, int32(16)},
 		{"Kafka.ClientID", cfg.Kafka.ClientID, "ledger-svc"},
 		{"Kafka.Brokers", cfg.Kafka.BootstrapServers(), "localhost:9092"},
 		{"Outbox.Topic", cfg.Outbox.Topic, "fintech.ledger.transactions"},
@@ -197,7 +201,7 @@ func TestValidate_CrossField(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			c := &Config{
 				Outbox: OutboxConfig{Workers: 4},
-				DB:     DBConfig{MaxConns: 20, MinConns: 4},
+				DB:     DBConfig{MaxConns: 20, MinConns: 4, AcquireTimeout: 500 * time.Millisecond, WorkerAcquireTimeout: 30 * time.Second, WorkerMaxConns: 8},
 				OTel:   OTelConfig{Sampler: "always_on", SamplerArg: 0.1},
 			}
 			tc.mutate(c)
@@ -215,7 +219,7 @@ func TestValidate_CrossField(t *testing.T) {
 func TestValidate_OK(t *testing.T) {
 	c := &Config{
 		Outbox: OutboxConfig{Workers: 4},
-		DB:     DBConfig{MaxConns: 20, MinConns: 4, AcquireTimeout: 500 * time.Millisecond},
+		DB:     DBConfig{MaxConns: 20, MinConns: 4, AcquireTimeout: 500 * time.Millisecond, WorkerAcquireTimeout: 30 * time.Second, WorkerMaxConns: 8},
 		OTel:   OTelConfig{Sampler: "always_on"},
 	}
 	if err := c.Validate(); err != nil {
@@ -240,7 +244,7 @@ func TestValidate_AcquireTimeoutBounds(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			c := &Config{
 				Outbox: OutboxConfig{Workers: 4},
-				DB:     DBConfig{MaxConns: 20, MinConns: 4, AcquireTimeout: tc.val},
+				DB:     DBConfig{MaxConns: 20, MinConns: 4, AcquireTimeout: tc.val, WorkerAcquireTimeout: 30 * time.Second, WorkerMaxConns: 8},
 				OTel:   OTelConfig{Sampler: "always_on"},
 			}
 			err := c.Validate()

@@ -133,31 +133,55 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 		log.Info("metrics endpoint serving", slog.String("addr", metricsServer))
 	}
 
-	// Postgres pool. MaxConns sized to host transactional load + the
-	// outbox worker fleet — each worker holds one conn for the duration
-	// of a drain (SELECT FOR UPDATE SKIP LOCKED + Kafka produce + UPDATE).
-	// The +OutboxWorkers headroom reflects the fact that workers are
-	// in-process; in a separate-deployment topology this would not apply.
-	poolCfg := repository.PoolConfig{
+	// Two pgxpools, one purpose each.
+	//
+	//   requestPool: short-deadline (500ms acquire) for the gRPC hot
+	//   path. When saturated, new requests fail fast with
+	//   ResourceExhausted instead of stretching p99 latency.
+	//
+	//   workerPool: long-deadline (30s acquire) for outbox drain +
+	//   reconciler. Background work; willing to wait for a slot.
+	//   Splitting prevents the request path from starving workers
+	//   under load and vice versa.
+	//
+	// PG max_connections must accommodate the SUM of both pool ceilings
+	// across all replicas plus a small admin reserve. With defaults:
+	// 250 (request) + 16 (worker) = 266 per replica.
+	requestPoolCfg := repository.PoolConfig{
 		DSN:             cfg.DB.URL,
-		MaxConns:        cfg.DB.MaxConns + int32(cfg.Outbox.Workers),
+		MaxConns:        cfg.DB.MaxConns,
 		MinConns:        cfg.DB.MinConns,
 		MaxConnLifetime: cfg.DB.ConnMaxLifetime,
 		MaxConnIdleTime: cfg.DB.ConnMaxIdleTime,
 		AcquireTimeout:  cfg.DB.AcquireTimeout,
 	}
-	pool, err := repository.NewPool(ctx, poolCfg)
+	requestPool, err := repository.NewPool(ctx, requestPoolCfg)
 	if err != nil {
-		return fmt.Errorf("postgres pool: %w", err)
+		return fmt.Errorf("postgres request pool: %w", err)
 	}
-	defer pool.Close()
-	// Periodic stats export so the gauges reflect pool occupancy even
-	// when no acquire is happening on the request path.
-	stopStatsExporter := repository.ExportPoolStats(ctx, pool, metrics.PoolAcquired, metrics.PoolIdle)
-	defer stopStatsExporter()
-	log.Info("postgres pool ready",
-		slog.Int64("max_conns", int64(poolCfg.MaxConns)),
-		slog.Duration("acquire_timeout", poolCfg.AcquireTimeout),
+	defer requestPool.Close()
+	stopReqStats := repository.ExportPoolStats(ctx, requestPool, metrics.PoolAcquired, metrics.PoolIdle)
+	defer stopReqStats()
+
+	workerPoolCfg := repository.PoolConfig{
+		DSN:             cfg.DB.URL,
+		MaxConns:        cfg.DB.WorkerMaxConns,
+		MinConns:        2,
+		MaxConnLifetime: cfg.DB.ConnMaxLifetime,
+		MaxConnIdleTime: cfg.DB.ConnMaxIdleTime,
+		AcquireTimeout:  cfg.DB.WorkerAcquireTimeout,
+	}
+	workerPool, err := repository.NewPool(ctx, workerPoolCfg)
+	if err != nil {
+		return fmt.Errorf("postgres worker pool: %w", err)
+	}
+	defer workerPool.Close()
+
+	log.Info("postgres pools ready",
+		slog.Int64("request_max", int64(requestPoolCfg.MaxConns)),
+		slog.Duration("request_acquire", requestPoolCfg.AcquireTimeout),
+		slog.Int64("worker_max", int64(workerPoolCfg.MaxConns)),
+		slog.Duration("worker_acquire", workerPoolCfg.AcquireTimeout),
 	)
 
 	// Redis (idempotency fast-path).
@@ -193,8 +217,8 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 	breakerCfg.MetricsOutcomes = metrics.DBTxOutcomes
 	breakerCfg.MetricsState = metrics.DBCircuitState
 	breaker := repository.NewBreaker(breakerCfg)
-	ledgerRepo := repository.NewLedgerRepo(pool, poolCfg, acquireMetrics).WithBreaker(breaker)
-	outboxRepo := repository.NewOutboxRepo(pool, poolCfg, acquireMetrics)
+	ledgerRepo := repository.NewLedgerRepo(requestPool, requestPoolCfg, acquireMetrics).WithBreaker(breaker)
+	outboxRepo := repository.NewOutboxRepo(workerPool, workerPoolCfg, acquireMetrics)
 
 	// Infrastructure adapters.
 	idemStore := infrastructure.NewRedisIdempotencyStore(redisClient)
@@ -234,7 +258,7 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 		if max <= 0 {
 			// Default: 2× the effective pool ceiling. Lets bursts absorb
 			// without queueing past the pgxpool wait depth.
-			max = int64(poolCfg.MaxConns) * 2
+			max = int64(requestPoolCfg.MaxConns) * 2
 		}
 		admCfg := interceptors.AdmissionConfig{
 			MaxInFlight:     max,
