@@ -36,12 +36,13 @@ type Config struct {
 	AppEnv   string `env:"APP_ENV"   envDefault:"development"`
 	LogLevel string `env:"LOG_LEVEL" envDefault:"info"`
 
-	GRPC   GRPCConfig
-	DB     DBConfig
-	Redis  RedisConfig
-	Kafka  KafkaConfig
-	Outbox OutboxConfig
-	OTel   OTelConfig
+	GRPC    GRPCConfig
+	Metrics MetricsConfig
+	DB      DBConfig
+	Redis   RedisConfig
+	Kafka   KafkaConfig
+	Outbox  OutboxConfig
+	OTel    OTelConfig
 }
 
 // GRPCConfig — gRPC server transport knobs.
@@ -50,14 +51,34 @@ type GRPCConfig struct {
 	ShutdownTimeout time.Duration `env:"GRPC_SHUTDOWN_TIMEOUT" envDefault:"30s"`
 }
 
-// DBConfig — Postgres pool sizing. Sized at boot to host transactional
-// load + the outbox worker fleet; see cmd/server/main.go for the formula.
+// MetricsConfig — Prometheus exposition (`/metrics`) listener. Empty Addr
+// disables the listener; useful in tests or environments that scrape
+// out-of-band.
+type MetricsConfig struct {
+	Addr string `env:"METRICS_ADDR" envDefault:":9100"`
+}
+
+// DBConfig — Postgres pool sizing.
+//
+// Sizing rule of thumb for the OLTP write path:
+//
+//	MaxConns ≥ TPS × p99_tx_seconds × safety_factor(2)
+//
+// At 10K TPS with 5ms p99 tx, that's 100 active connections; default 120
+// leaves headroom. PG's max_connections must accommodate the sum across
+// replicas + outbox workers.
+//
+// AcquireTimeout is enforced per call by repository.AcquireConn /
+// BeginTxWithAcquire. Set strictly less than the typical client deadline:
+// failing fast on pool starvation is preferable to consuming the request's
+// remaining budget in the wait queue.
 type DBConfig struct {
 	URL             string        `env:"DATABASE_URL,required"`
-	MaxConns        int32         `env:"DATABASE_MAX_CONNS"     envDefault:"20"`
-	MinConns        int32         `env:"DATABASE_MIN_CONNS"     envDefault:"4"`
-	ConnMaxLifetime time.Duration `env:"DATABASE_CONN_MAX_LIFE" envDefault:"30m"`
-	ConnMaxIdleTime time.Duration `env:"DATABASE_CONN_MAX_IDLE" envDefault:"5m"`
+	MaxConns        int32         `env:"DATABASE_MAX_CONNS"        envDefault:"120"`
+	MinConns        int32         `env:"DATABASE_MIN_CONNS"        envDefault:"20"`
+	ConnMaxLifetime time.Duration `env:"DATABASE_CONN_MAX_LIFE"    envDefault:"1h"`
+	ConnMaxIdleTime time.Duration `env:"DATABASE_CONN_MAX_IDLE"    envDefault:"30m"`
+	AcquireTimeout  time.Duration `env:"DATABASE_ACQUIRE_TIMEOUT"  envDefault:"500ms"`
 }
 
 // RedisConfig — idempotency-store coordinates. Required: the SETNX
@@ -143,6 +164,21 @@ func (c *Config) Validate() error {
 		errs = append(errs, fmt.Errorf(
 			"DATABASE_MAX_CONNS (%d) must be >= DATABASE_MIN_CONNS (%d)",
 			c.DB.MaxConns, c.DB.MinConns))
+	}
+	// AcquireTimeout sanity bounds. Below ~50ms is almost always a typo
+	// (request-path tx commits routinely take that long under load); above
+	// ~30s defeats the point of the timeout (the request's own deadline
+	// would fire first). Either signals a misconfigured deployment.
+	const (
+		minAcquireTimeout = 50 * time.Millisecond
+		maxAcquireTimeout = 30 * time.Second
+	)
+	if c.DB.AcquireTimeout <= 0 ||
+		c.DB.AcquireTimeout < minAcquireTimeout ||
+		c.DB.AcquireTimeout > maxAcquireTimeout {
+		errs = append(errs, fmt.Errorf(
+			"DATABASE_ACQUIRE_TIMEOUT must be in [%s, %s] (got %s)",
+			minAcquireTimeout, maxAcquireTimeout, c.DB.AcquireTimeout))
 	}
 	if c.OTel.Sampler == "traceidratio" || c.OTel.Sampler == "parentbased_traceidratio" {
 		if c.OTel.SamplerArg < 0 || c.OTel.SamplerArg > 1 {

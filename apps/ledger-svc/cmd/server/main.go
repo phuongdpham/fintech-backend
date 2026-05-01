@@ -15,6 +15,7 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
@@ -112,23 +113,47 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 		slog.String("endpoint", cfg.OTel.Endpoint),
 		slog.Bool("stdout_debug", cfg.OTel.StdoutDebug))
 
+	// Prometheus registry + named metric handles. /metrics HTTP server
+	// is started below — needs to be running before pgxpool init so the
+	// scraper can see acquire-wait observations from boot onward.
+	metrics := observability.NewMetrics()
+	acquireMetrics := repository.PromAcquireMetrics{Wait: metrics.PoolAcquireWait}
+
+	metricsServer, metricsShutdown, err := startMetricsServer(cfg.Metrics.Addr, metrics.Handler(), log)
+	if err != nil {
+		return fmt.Errorf("metrics server: %w", err)
+	}
+	defer metricsShutdown()
+	if metricsServer != "" {
+		log.Info("metrics endpoint serving", slog.String("addr", metricsServer))
+	}
+
 	// Postgres pool. MaxConns sized to host transactional load + the
 	// outbox worker fleet — each worker holds one conn for the duration
 	// of a drain (SELECT FOR UPDATE SKIP LOCKED + Kafka produce + UPDATE).
 	// The +OutboxWorkers headroom reflects the fact that workers are
 	// in-process; in a separate-deployment topology this would not apply.
-	pool, err := repository.NewPool(ctx, repository.PoolConfig{
+	poolCfg := repository.PoolConfig{
 		DSN:             cfg.DB.URL,
 		MaxConns:        cfg.DB.MaxConns + int32(cfg.Outbox.Workers),
 		MinConns:        cfg.DB.MinConns,
 		MaxConnLifetime: cfg.DB.ConnMaxLifetime,
 		MaxConnIdleTime: cfg.DB.ConnMaxIdleTime,
-	})
+		AcquireTimeout:  cfg.DB.AcquireTimeout,
+	}
+	pool, err := repository.NewPool(ctx, poolCfg)
 	if err != nil {
 		return fmt.Errorf("postgres pool: %w", err)
 	}
 	defer pool.Close()
-	log.Info("postgres pool ready")
+	// Periodic stats export so the gauges reflect pool occupancy even
+	// when no acquire is happening on the request path.
+	stopStatsExporter := repository.ExportPoolStats(ctx, pool, metrics.PoolAcquired, metrics.PoolIdle)
+	defer stopStatsExporter()
+	log.Info("postgres pool ready",
+		slog.Int64("max_conns", int64(poolCfg.MaxConns)),
+		slog.Duration("acquire_timeout", poolCfg.AcquireTimeout),
+	)
 
 	// Redis (idempotency fast-path).
 	redisOpts, err := redis.ParseURL(cfg.Redis.URL)
@@ -159,8 +184,8 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 	log.Info("kafka producer ready")
 
 	// Repository layer (Postgres).
-	ledgerRepo := repository.NewLedgerRepo(pool)
-	outboxRepo := repository.NewOutboxRepo(pool)
+	ledgerRepo := repository.NewLedgerRepo(pool, poolCfg, acquireMetrics)
+	outboxRepo := repository.NewOutboxRepo(pool, poolCfg, acquireMetrics)
 
 	// Infrastructure adapters.
 	idemStore := infrastructure.NewRedisIdempotencyStore(redisClient)
@@ -250,5 +275,39 @@ func newLogger(level string) *slog.Logger {
 		lvl = slog.LevelInfo
 	}
 	return slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: lvl}))
+}
+
+// startMetricsServer starts an HTTP listener that serves Prometheus
+// exposition at /metrics. Returns the bound address (helpful when addr
+// is `:0` in tests), a shutdown closure, or an error if the listener
+// can't bind. Empty addr disables the server (returns no-op shutdown).
+func startMetricsServer(addr string, h http.Handler, log *slog.Logger) (string, func(), error) {
+	if addr == "" {
+		return "", func() {}, nil
+	}
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", h)
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	srv := &http.Server{
+		Addr:              addr,
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+	errCh := make(chan error, 1)
+	go func() {
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			errCh <- err
+			log.Error("metrics server exited", slog.Any("err", err))
+		}
+		close(errCh)
+	}()
+	shutdown := func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(ctx)
+	}
+	return addr, shutdown, nil
 }
 

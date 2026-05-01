@@ -53,10 +53,12 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	pool, err := repository.NewPool(ctx, repository.PoolConfig{
-		DSN:      cfg.DB.URL,
-		MaxConns: 8, // reconciler is low-traffic; small pool is enough
-	})
+	poolCfg := repository.PoolConfig{
+		DSN:            cfg.DB.URL,
+		MaxConns:       8, // reconciler is low-traffic; small pool is enough
+		AcquireTimeout: cfg.DB.AcquireTimeout,
+	}
+	pool, err := repository.NewPool(ctx, poolCfg)
 	if err != nil {
 		fail("pool init: " + err.Error())
 	}
@@ -71,7 +73,10 @@ func main() {
 	}
 	defer producer.Close()
 
-	outboxRepo := repository.NewOutboxRepo(pool)
+	// Reconciler doesn't expose /metrics; pass nil and let the no-op
+	// adapter swallow observations. If we ever wire a reconciler-side
+	// Prometheus registry, replace nil with PromAcquireMetrics here.
+	outboxRepo := repository.NewOutboxRepo(pool, poolCfg, nil)
 	rec := infrastructure.NewReconciler(
 		outboxRepo,
 		outboxRepo,

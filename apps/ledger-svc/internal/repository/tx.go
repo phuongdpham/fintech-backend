@@ -23,14 +23,21 @@ import (
 // a balance and both succeeding when only one should. The cost is more
 // 40001 retries under contention, which is exactly what this wrapper
 // absorbs.
+//
+// poolCfg.AcquireTimeout caps how long a single attempt waits for a free
+// connection; metrics observes acquire wait latency (one observation per
+// attempt). Either may be zero / nil — passing nil metrics yields a no-op.
 func InTx(
 	ctx context.Context,
 	pool *pgxpool.Pool,
-	cfg RetryConfig,
+	poolCfg PoolConfig,
+	retry RetryConfig,
+	metrics AcquireMetrics,
 	fn func(ctx context.Context, tx pgx.Tx) error,
 ) error {
-	return WithRetryOnSerializationFailure(ctx, cfg, func() (returnedErr error) {
-		tx, err := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.Serializable})
+	return WithRetryOnSerializationFailure(ctx, retry, func() (returnedErr error) {
+		tx, err := BeginTxWithAcquire(ctx, pool, poolCfg, metrics,
+			pgx.TxOptions{IsoLevel: pgx.Serializable})
 		if err != nil {
 			return fmt.Errorf("repository: begin tx: %w", err)
 		}

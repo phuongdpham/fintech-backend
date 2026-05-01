@@ -4,6 +4,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 )
 
 // clearAll wipes every env key the Config struct touches and registers
@@ -99,8 +100,9 @@ func TestLoad_Defaults(t *testing.T) {
 		{"AppEnv", cfg.AppEnv, "development"},
 		{"LogLevel", cfg.LogLevel, "info"},
 		{"GRPC.Addr", cfg.GRPC.Addr, ":9090"},
-		{"DB.MaxConns", cfg.DB.MaxConns, int32(20)},
-		{"DB.MinConns", cfg.DB.MinConns, int32(4)},
+		{"DB.MaxConns", cfg.DB.MaxConns, int32(120)},
+		{"DB.MinConns", cfg.DB.MinConns, int32(20)},
+		{"DB.AcquireTimeout", cfg.DB.AcquireTimeout, 500 * time.Millisecond},
 		{"Kafka.ClientID", cfg.Kafka.ClientID, "ledger-svc"},
 		{"Kafka.Brokers", cfg.Kafka.BootstrapServers(), "localhost:9092"},
 		{"Outbox.Topic", cfg.Outbox.Topic, "fintech.ledger.transactions"},
@@ -213,10 +215,44 @@ func TestValidate_CrossField(t *testing.T) {
 func TestValidate_OK(t *testing.T) {
 	c := &Config{
 		Outbox: OutboxConfig{Workers: 4},
-		DB:     DBConfig{MaxConns: 20, MinConns: 4},
+		DB:     DBConfig{MaxConns: 20, MinConns: 4, AcquireTimeout: 500 * time.Millisecond},
 		OTel:   OTelConfig{Sampler: "always_on"},
 	}
 	if err := c.Validate(); err != nil {
 		t.Fatalf("expected no error, got %v", err)
+	}
+}
+
+func TestValidate_AcquireTimeoutBounds(t *testing.T) {
+	cases := []struct {
+		name string
+		val  time.Duration
+		ok   bool
+	}{
+		{"zero rejected", 0, false},
+		{"too low", 1 * time.Millisecond, false},
+		{"min boundary", 50 * time.Millisecond, true},
+		{"typical", 500 * time.Millisecond, true},
+		{"max boundary", 30 * time.Second, true},
+		{"too high", 31 * time.Second, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := &Config{
+				Outbox: OutboxConfig{Workers: 4},
+				DB:     DBConfig{MaxConns: 20, MinConns: 4, AcquireTimeout: tc.val},
+				OTel:   OTelConfig{Sampler: "always_on"},
+			}
+			err := c.Validate()
+			if tc.ok && err != nil {
+				t.Fatalf("expected no error for %s, got %v", tc.val, err)
+			}
+			if !tc.ok && err == nil {
+				t.Fatalf("expected error for %s, got nil", tc.val)
+			}
+			if !tc.ok && !strings.Contains(err.Error(), "DATABASE_ACQUIRE_TIMEOUT") {
+				t.Fatalf("expected error to mention DATABASE_ACQUIRE_TIMEOUT, got %v", err)
+			}
+		})
 	}
 }

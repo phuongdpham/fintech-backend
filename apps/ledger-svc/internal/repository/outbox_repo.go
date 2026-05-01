@@ -30,11 +30,18 @@ type DrainPublisher func(ctx context.Context, events []*domain.OutboxEvent) (suc
 //	Drain      — hot path; picks any PENDING row (FOR UPDATE SKIP LOCKED).
 //	DrainStale — reconciler; only rows older than staleAfter still PENDING.
 type OutboxRepo struct {
-	pool *pgxpool.Pool
+	pool       *pgxpool.Pool
+	acquireCfg PoolConfig
+	metrics    AcquireMetrics
 }
 
-func NewOutboxRepo(pool *pgxpool.Pool) *OutboxRepo {
-	return &OutboxRepo{pool: pool}
+// NewOutboxRepo wires the repo against a pool. acquireCfg.AcquireTimeout
+// caps each Drain's connection-acquire wait; metrics may be nil.
+func NewOutboxRepo(pool *pgxpool.Pool, acquireCfg PoolConfig, metrics AcquireMetrics) *OutboxRepo {
+	if metrics == nil {
+		metrics = nopAcquireMetrics{}
+	}
+	return &OutboxRepo{pool: pool, acquireCfg: acquireCfg, metrics: metrics}
 }
 
 const (
@@ -102,7 +109,8 @@ func (r *OutboxRepo) drain(ctx context.Context, selectSQL string, args []any, pu
 		return 0, fmt.Errorf("repository: drain publisher is required")
 	}
 
-	tx, err := r.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	tx, err := BeginTxWithAcquire(ctx, r.pool, r.acquireCfg, r.metrics,
+		pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
 		return 0, fmt.Errorf("repository: begin outbox tx: %w", err)
 	}

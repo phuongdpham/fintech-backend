@@ -16,17 +16,27 @@ import (
 // LedgerRepo is the Postgres implementation of domain.LedgerRepository.
 // All writes go through InTx (Serializable + 40001 retry).
 type LedgerRepo struct {
-	pool   *pgxpool.Pool
-	retry  RetryConfig
-	now    func() time.Time
-	newID  func() uuid.UUID
+	pool       *pgxpool.Pool
+	acquireCfg PoolConfig // honored by BeginTxWithAcquire (timeout + metric)
+	metrics    AcquireMetrics
+	retry      RetryConfig
+	now        func() time.Time
+	newID      func() uuid.UUID
 }
 
-func NewLedgerRepo(pool *pgxpool.Pool) *LedgerRepo {
+// NewLedgerRepo wires the repo against a pool. acquireCfg.AcquireTimeout
+// caps each tx's connection-acquire wait; metrics may be nil for tests
+// (replaced with a no-op).
+func NewLedgerRepo(pool *pgxpool.Pool, acquireCfg PoolConfig, metrics AcquireMetrics) *LedgerRepo {
+	if metrics == nil {
+		metrics = nopAcquireMetrics{}
+	}
 	return &LedgerRepo{
-		pool:  pool,
-		retry: DefaultRetryConfig(),
-		now:   func() time.Time { return time.Now().UTC() },
+		pool:       pool,
+		acquireCfg: acquireCfg,
+		metrics:    metrics,
+		retry:      DefaultRetryConfig(),
+		now:        func() time.Time { return time.Now().UTC() },
 		// UUIDv7: time-ordered prefix → INSERTs append to the right edge
 		// of the B-tree on transactions(id), journal_entries(id), and
 		// outbox_events(id), avoiding the leaf-thrash v4 causes under load.
@@ -138,7 +148,7 @@ func (r *LedgerRepo) ExecuteTransfer(ctx context.Context, req domain.TransferReq
 
 	outboxID := r.newID()
 
-	err := InTx(ctx, r.pool, r.retry, func(ctx context.Context, tx pgx.Tx) error {
+	err := InTx(ctx, r.pool, r.acquireCfg, r.retry, r.metrics, func(ctx context.Context, tx pgx.Tx) error {
 		if _, err := tx.Exec(ctx, insertTransactionSQL,
 			transaction.ID, transaction.TenantID, transaction.IdempotencyKey,
 			transaction.RequestFingerprint,
