@@ -67,8 +67,20 @@ CREATE TABLE transactions (
     CONSTRAINT transactions_id_tenant_key   UNIQUE (id, tenant_id)
 );
 
+-- journal_entries: range-by-month → hash-by-tenant (16 subparts).
+--
+-- Without subpartitioning, every write at the current month hits the
+-- same B-tree leaves on the journal_entries indexes. Hash-spreading
+-- by tenant scatters writes across 16 separate physical tables within
+-- the current month — N× headroom on hot-month index contention with
+-- no application-side change.
+--
+-- PK includes both partition keys (created_at and tenant_id) per PG
+-- declarative-partitioning rules. The composite FKs to accounts /
+-- transactions stay; FKs from a partitioned table to a non-partitioned
+-- one are supported since PG12.
 CREATE TABLE journal_entries (
-    id             UUID            PRIMARY KEY DEFAULT uuidv7(),
+    id             UUID            NOT NULL DEFAULT uuidv7(),
     transaction_id UUID            NOT NULL REFERENCES transactions(id),
     tenant_id      VARCHAR(128)    NOT NULL,
     account_id     UUID            NOT NULL REFERENCES accounts(id),
@@ -88,8 +100,42 @@ CREATE TABLE journal_entries (
         REFERENCES accounts (id, tenant_id),
     CONSTRAINT fk_je_tx_tenant
         FOREIGN KEY (transaction_id, tenant_id)
-        REFERENCES transactions (id, tenant_id)
-);
+        REFERENCES transactions (id, tenant_id),
+    PRIMARY KEY (id, created_at, tenant_id)
+) PARTITION BY RANGE (created_at);
+
+-- Bootstrap partitions: 6 month-ranges × 16 hash subparts = 96 leaf
+-- partitions. Production needs a partition manager (pg_partman / cron)
+-- to extend the range; running short hard-fails INSERTs (no default
+-- partition by design — silent fallback to a catch-all defeats the
+-- per-month physical isolation we depend on for retention).
+DO $$
+DECLARE
+    months  text[] := ARRAY['2026-05','2026-06','2026-07','2026-08','2026-09','2026-10'];
+    suffix  text;
+    nextm   text;
+    i       int;
+BEGIN
+    FOREACH suffix IN ARRAY months LOOP
+        nextm := to_char((suffix || '-01')::date + interval '1 month', 'YYYY-MM');
+        EXECUTE format(
+            'CREATE TABLE journal_entries_y%s PARTITION OF journal_entries
+                FOR VALUES FROM (%L) TO (%L)
+                PARTITION BY HASH (tenant_id)',
+            replace(suffix, '-', 'm'),
+            suffix || '-01',
+            nextm || '-01'
+        );
+        FOR i IN 0..15 LOOP
+            EXECUTE format(
+                'CREATE TABLE journal_entries_y%s_h%s PARTITION OF journal_entries_y%s
+                    FOR VALUES WITH (MODULUS 16, REMAINDER %s)',
+                replace(suffix, '-', 'm'), lpad(i::text, 2, '0'),
+                replace(suffix, '-', 'm'), i
+            );
+        END LOOP;
+    END LOOP;
+END $$;
 
 -- Transactional Outbox — atomically committed alongside ledger writes,
 -- drained by the Outbox Relay Worker. Decouples DB durability from
@@ -136,6 +182,9 @@ CREATE INDEX idx_outbox_pending  ON outbox_events  (created_at)
 -- "give me the latest entry_hash for tenant X", indexed below.
 -- ----------------------------------------------------------------------------
 
+-- audit_log: range-by-month → hash-by-tenant (16 subparts).
+-- Same reasoning as journal_entries: spread current-month writes across
+-- 16 physical tables to remove the single-leaf hotspot.
 CREATE TABLE audit_log (
     id              UUID            NOT NULL DEFAULT uuidv7(),
     occurred_at     TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
@@ -151,8 +200,8 @@ CREATE TABLE audit_log (
     after_state     JSONB,
     prev_hash       BYTEA           NOT NULL,
     entry_hash      BYTEA           NOT NULL,
-    -- Partition key MUST be in the primary key for declarative partitioning.
-    PRIMARY KEY (id, occurred_at)
+    -- Both partition keys MUST be in the primary key.
+    PRIMARY KEY (id, occurred_at, tenant_id)
 ) PARTITION BY RANGE (occurred_at);
 
 -- Hot read path: "latest entry_hash for tenant X" on every audit write.
@@ -167,13 +216,34 @@ CREATE INDEX idx_audit_aggregate
 CREATE INDEX idx_audit_actor
     ON audit_log (tenant_id, actor_subject, occurred_at);
 
--- Bootstrap partitions: current month + five ahead. Production needs a
--- partition manager to keep rolling; running short of partitions hard-
--- fails INSERTs (no default partition by design — silent fallback to a
--- catch-all partition would defeat the audit-row time guarantees).
-CREATE TABLE audit_log_y2026m05 PARTITION OF audit_log FOR VALUES FROM ('2026-05-01') TO ('2026-06-01');
-CREATE TABLE audit_log_y2026m06 PARTITION OF audit_log FOR VALUES FROM ('2026-06-01') TO ('2026-07-01');
-CREATE TABLE audit_log_y2026m07 PARTITION OF audit_log FOR VALUES FROM ('2026-07-01') TO ('2026-08-01');
-CREATE TABLE audit_log_y2026m08 PARTITION OF audit_log FOR VALUES FROM ('2026-08-01') TO ('2026-09-01');
-CREATE TABLE audit_log_y2026m09 PARTITION OF audit_log FOR VALUES FROM ('2026-09-01') TO ('2026-10-01');
-CREATE TABLE audit_log_y2026m10 PARTITION OF audit_log FOR VALUES FROM ('2026-10-01') TO ('2026-11-01');
+-- Bootstrap partitions: 6 month-ranges × 16 hash subparts = 96 leaf
+-- partitions. Production needs a partition manager (pg_partman / cron)
+-- to extend the range; running short hard-fails INSERTs (no default
+-- partition by design).
+DO $$
+DECLARE
+    months  text[] := ARRAY['2026-05','2026-06','2026-07','2026-08','2026-09','2026-10'];
+    suffix  text;
+    nextm   text;
+    i       int;
+BEGIN
+    FOREACH suffix IN ARRAY months LOOP
+        nextm := to_char((suffix || '-01')::date + interval '1 month', 'YYYY-MM');
+        EXECUTE format(
+            'CREATE TABLE audit_log_y%s PARTITION OF audit_log
+                FOR VALUES FROM (%L) TO (%L)
+                PARTITION BY HASH (tenant_id)',
+            replace(suffix, '-', 'm'),
+            suffix || '-01',
+            nextm || '-01'
+        );
+        FOR i IN 0..15 LOOP
+            EXECUTE format(
+                'CREATE TABLE audit_log_y%s_h%s PARTITION OF audit_log_y%s
+                    FOR VALUES WITH (MODULUS 16, REMAINDER %s)',
+                replace(suffix, '-', 'm'), lpad(i::text, 2, '0'),
+                replace(suffix, '-', 'm'), i
+            );
+        END LOOP;
+    END LOOP;
+END $$;
