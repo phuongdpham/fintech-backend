@@ -14,6 +14,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	"github.com/phuongdpham/fintech/apps/ledger-svc/internal/domain"
+	"github.com/phuongdpham/fintech/apps/ledger-svc/internal/repository"
 )
 
 // errorMapping is the exhaustive translation table from domain sentinels
@@ -39,6 +40,9 @@ var errorMapping = []struct {
 	{domain.ErrTenantRequired, codes.Unauthenticated},
 	{domain.ErrAccountTenantMismatch, codes.PermissionDenied},
 	{domain.ErrRequestFingerprintMismatch, codes.FailedPrecondition},
+	// Repository circuit-open: client should retry after a short delay.
+	// Unavailable matches gRPC's documented "transient backoff" semantics.
+	{repository.ErrCircuitOpen, codes.Unavailable},
 }
 
 // asGRPCError translates a domain or wrapped error to a gRPC status error.

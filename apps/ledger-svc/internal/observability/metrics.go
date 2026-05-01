@@ -59,6 +59,14 @@ type Metrics struct {
 	// AdmissionInFlight — gauge of currently admitted RPCs. Useful
 	// for "are we sustained at capacity" dashboards.
 	AdmissionInFlight prometheus.Gauge
+
+	// DBTxOutcomes — per-(tenant, method, outcome) counter feeding the
+	// circuit breaker's retry-rate dashboards. outcome ∈ {ok, cap_reached}.
+	DBTxOutcomes *prometheus.CounterVec
+	// DBCircuitState — gauge with values {0:closed, 1:half-open, 2:open}.
+	// One time series per (tenant, method) — bound at the source by the
+	// closed method set and tier-bucketed tenants.
+	DBCircuitState *prometheus.GaugeVec
 }
 
 // NewMetrics constructs the metric handles and registers them on a
@@ -112,10 +120,25 @@ func NewMetrics() *Metrics {
 			Name: "grpc_admission_inflight",
 			Help: "Current number of admitted (in-flight) RPCs.",
 		}),
+		DBTxOutcomes: prometheus.NewCounterVec(
+			prometheus.CounterOpts{
+				Name: "db_tx_outcomes_total",
+				Help: "Outcomes of repository tx operations: ok or cap_reached (retry budget exhausted).",
+			},
+			[]string{"tenant", "method", "outcome"},
+		),
+		DBCircuitState: prometheus.NewGaugeVec(
+			prometheus.GaugeOpts{
+				Name: "db_tx_circuit_state",
+				Help: "Per-(tenant, method) breaker state: 0=closed, 1=half-open, 2=open.",
+			},
+			[]string{"tenant", "method"},
+		),
 	}
 	reg.MustRegister(
 		m.PoolAcquireWait, m.PoolAcquired, m.PoolIdle,
 		m.RateLimitRejected, m.AdmissionRejected, m.AdmissionInFlight,
+		m.DBTxOutcomes, m.DBCircuitState,
 	)
 	return m
 }

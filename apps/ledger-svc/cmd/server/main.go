@@ -189,7 +189,11 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 	log.Info("kafka producer ready")
 
 	// Repository layer (Postgres).
-	ledgerRepo := repository.NewLedgerRepo(pool, poolCfg, acquireMetrics)
+	breakerCfg := repository.DefaultBreakerConfig()
+	breakerCfg.MetricsOutcomes = metrics.DBTxOutcomes
+	breakerCfg.MetricsState = metrics.DBCircuitState
+	breaker := repository.NewBreaker(breakerCfg)
+	ledgerRepo := repository.NewLedgerRepo(pool, poolCfg, acquireMetrics).WithBreaker(breaker)
 	outboxRepo := repository.NewOutboxRepo(pool, poolCfg, acquireMetrics)
 
 	// Infrastructure adapters.

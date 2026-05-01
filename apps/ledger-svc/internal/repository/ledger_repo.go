@@ -20,8 +20,17 @@ type LedgerRepo struct {
 	acquireCfg PoolConfig // honored by BeginTxWithAcquire (timeout + metric)
 	metrics    AcquireMetrics
 	retry      RetryConfig
+	breaker    *Breaker // optional; nil disables circuit-break
 	now        func() time.Time
 	newID      func() uuid.UUID
+}
+
+// WithBreaker returns a copy of r with the circuit breaker installed.
+// Call once at boot. Production wires this; tests typically pass nil.
+func (r *LedgerRepo) WithBreaker(b *Breaker) *LedgerRepo {
+	cp := *r
+	cp.breaker = b
+	return &cp
 }
 
 // NewLedgerRepo wires the repo against a pool. acquireCfg.AcquireTimeout
@@ -148,6 +157,15 @@ func (r *LedgerRepo) ExecuteTransfer(ctx context.Context, req domain.TransferReq
 
 	outboxID := r.newID()
 
+	// Per-(tenant, op) circuit breaker: when correlated 40001 storms
+	// dominate (hot account contention), failing fast for 1s prevents
+	// retry-amplification meltdown while letting unrelated tenants keep
+	// flowing.
+	breakerKey := BreakerKey(req.TenantID, "ExecuteTransfer")
+	if r.breaker != nil && !r.breaker.Allow(breakerKey) {
+		return nil, ErrCircuitOpen
+	}
+
 	err := InTx(ctx, r.pool, r.acquireCfg, r.retry, r.metrics, func(ctx context.Context, tx pgx.Tx) error {
 		if _, err := tx.Exec(ctx, insertTransactionSQL,
 			transaction.ID, transaction.TenantID, transaction.IdempotencyKey,
@@ -205,6 +223,12 @@ func (r *LedgerRepo) ExecuteTransfer(ctx context.Context, req domain.TransferReq
 
 		return nil
 	})
+	// Feed breaker outcome before returning. capReached=true is the
+	// signal that we exhausted the retry budget on 40001 — a strong
+	// indicator of correlated contention.
+	if r.breaker != nil {
+		r.breaker.RecordOutcome(breakerKey, errors.Is(err, ErrRetryCapReached))
+	}
 	if err != nil {
 		return nil, err
 	}

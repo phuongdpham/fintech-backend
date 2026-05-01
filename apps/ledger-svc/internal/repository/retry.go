@@ -3,11 +3,24 @@ package repository
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math/rand/v2"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
 )
+
+// ErrRetryCapReached wraps the last 40001 error after MaxAttempts
+// retries fail. Callers (specifically the breaker integration) detect
+// this via errors.Is to record the cap-reached signal — that's the
+// "we'd have retried more under unbounded retry" event the breaker
+// uses to decide whether to trip.
+var ErrRetryCapReached = errors.New("repository: serialization retry cap reached")
+
+// ErrCircuitOpen reports that the per-(tenant,method) breaker is open
+// and this attempt was rejected fast. Callers should map to gRPC
+// Unavailable upstream so the client can back off.
+var ErrCircuitOpen = errors.New("repository: circuit breaker open")
 
 // PostgreSQL SQLSTATE codes we react to.
 //
@@ -41,7 +54,7 @@ type RetryConfig struct {
 
 func DefaultRetryConfig() RetryConfig {
 	return RetryConfig{
-		MaxAttempts:    5,
+		MaxAttempts:    3,
 		InitialBackoff: 5 * time.Millisecond,
 		MaxBackoff:     200 * time.Millisecond,
 		JitterFraction: 0.25,
@@ -76,13 +89,17 @@ func IsForeignKeyViolation(err error) bool {
 //
 // fn MUST be idempotent across retries — no externally-visible side effects
 // outside the DB transaction it owns.
+//
+// On exhausted retries, the final 40001 error is wrapped in
+// ErrRetryCapReached so circuit-breaker integrations can distinguish
+// "ran out of retries" from "non-retryable error from the start."
 func WithRetryOnSerializationFailure(ctx context.Context, cfg RetryConfig, fn func() error) error {
 	if cfg.MaxAttempts <= 0 {
 		cfg = DefaultRetryConfig()
 	}
 	var err error
 	backoff := cfg.InitialBackoff
-	for attempt := 0; attempt < cfg.MaxAttempts; attempt++ {
+	for attempt := range cfg.MaxAttempts {
 		err = fn()
 		if err == nil {
 			return nil
@@ -103,7 +120,7 @@ func WithRetryOnSerializationFailure(ctx context.Context, cfg RetryConfig, fn fu
 			backoff = cfg.MaxBackoff
 		}
 	}
-	return err
+	return fmt.Errorf("%w: %w", ErrRetryCapReached, err)
 }
 
 func jitter(d time.Duration, frac float64) time.Duration {
