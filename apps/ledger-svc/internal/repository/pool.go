@@ -185,8 +185,17 @@ func ExportPoolStats(ctx context.Context, pool *pgxpool.Pool, acquired, idle pro
 
 // BeginTxWithAcquire is the metric-aware equivalent of pool.BeginTx —
 // it acquires a connection through AcquireConn (so wait time gets
-// observed) then begins a transaction on it. Caller MUST call tx.Commit
-// or tx.Rollback; releasing the conn is automatic on tx termination.
+// observed) then begins a transaction on it.
+//
+// Returns a wrapper tx that releases the underlying *pgxpool.Conn to
+// the pool on Commit or Rollback. This wrapper is necessary because
+// *pgxpool.Conn.BeginTx returns the raw pgx.Tx (from the inner
+// *pgx.Conn), NOT a *pgxpool.Tx — so the raw tx's Commit/Rollback do
+// not know about the pool and will not release. Only pool.BeginTx
+// returns an auto-releasing tx, but that path doesn't let us observe
+// the acquire-wait metric independently. So we wrap.
+//
+// Caller MUST call tx.Commit or tx.Rollback exactly once.
 func BeginTxWithAcquire(
 	ctx context.Context,
 	pool *pgxpool.Pool,
@@ -198,10 +207,47 @@ func BeginTxWithAcquire(
 	if err != nil {
 		return nil, err
 	}
-	tx, err := conn.BeginTx(ctx, opts)
+	rawTx, err := conn.BeginTx(ctx, opts)
 	if err != nil {
 		conn.Release()
 		return nil, err
 	}
-	return tx, nil
+	return &releasingTx{Tx: rawTx, conn: conn}, nil
+}
+
+// releasingTx wraps a pgx.Tx returned by *pgxpool.Conn.BeginTx and
+// releases the *pgxpool.Conn back to the pool when the tx terminates.
+// All other pgx.Tx methods are inherited via embedding.
+//
+// Why this exists: *pgxpool.Conn.BeginTx is documented as starting a
+// tx "from the conn" but the returned Tx has no link back to the
+// *pgxpool.Conn — so without this wrapper, Commit/Rollback would
+// release the underlying network resource at PG's level but leave the
+// pool slot marked acquired forever. That's the leak.
+type releasingTx struct {
+	pgx.Tx
+	conn     *pgxpool.Conn
+	released bool
+}
+
+func (t *releasingTx) Commit(ctx context.Context) error {
+	err := t.Tx.Commit(ctx)
+	t.release()
+	return err
+}
+
+func (t *releasingTx) Rollback(ctx context.Context) error {
+	err := t.Tx.Rollback(ctx)
+	t.release()
+	return err
+}
+
+// release is idempotent so a deferred Rollback after a successful
+// Commit (the standard pattern) doesn't double-release.
+func (t *releasingTx) release() {
+	if t.released {
+		return
+	}
+	t.released = true
+	t.conn.Release()
 }

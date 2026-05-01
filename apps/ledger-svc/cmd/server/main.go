@@ -183,6 +183,32 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 		slog.Int64("worker_max", int64(workerPoolCfg.MaxConns)),
 		slog.Duration("worker_acquire", workerPoolCfg.AcquireTimeout),
 	)
+	// Pool stats heartbeat — debug-only so prod stays quiet. At INFO this
+	// gets spammy under load; at DEBUG it's the right granularity for
+	// diffing request-pool vs worker-pool during a load run. Worker-pool
+	// gauges aren't first-class Prometheus metrics yet (request pool is,
+	// via PoolAcquired/PoolIdle); promote when the second consumer asks.
+	go func() {
+		t := time.NewTicker(5 * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				rs := requestPool.Stat()
+				ws := workerPool.Stat()
+				log.Debug("pool stats",
+					slog.Int64("req_acquired", int64(rs.AcquiredConns())),
+					slog.Int64("req_idle", int64(rs.IdleConns())),
+					slog.Int64("req_total", int64(rs.TotalConns())),
+					slog.Int64("wkr_acquired", int64(ws.AcquiredConns())),
+					slog.Int64("wkr_idle", int64(ws.IdleConns())),
+					slog.Int64("wkr_total", int64(ws.TotalConns())),
+				)
+			}
+		}
+	}()
 
 	// Redis (idempotency fast-path).
 	redisOpts, err := redis.ParseURL(cfg.Redis.URL)
