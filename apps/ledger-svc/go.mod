@@ -11,6 +11,7 @@ require github.com/phuongdpham/fintech/libs/go/proto-gen v0.0.0
 replace github.com/phuongdpham/fintech/libs/go/proto-gen => ../../libs/go/proto-gen
 
 require (
+	github.com/KimMachineGun/automemlimit v0.7.5
 	github.com/caarlos0/env/v11 v11.4.0
 	github.com/confluentinc/confluent-kafka-go/v2 v2.14.1
 	github.com/golang-migrate/migrate/v4 v4.19.1
@@ -18,6 +19,7 @@ require (
 	github.com/jackc/pgx/v5 v5.9.2
 	github.com/joho/godotenv v1.5.1
 	github.com/prometheus/client_golang v1.23.2
+	github.com/prometheus/client_model v0.6.2
 	github.com/redis/go-redis/v9 v9.18.0
 	github.com/shopspring/decimal v1.4.0
 	github.com/stretchr/testify v1.11.1
@@ -54,8 +56,8 @@ require (
 	github.com/moby/sys/atomicwriter v0.1.0 // indirect
 	github.com/moby/sys/user v0.4.0 // indirect
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
+	github.com/pbnjay/memory v0.0.0-20210728143218-7b4eea64cf58 // indirect
 	github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2 // indirect
-	github.com/prometheus/client_model v0.6.2 // indirect
 	github.com/prometheus/common v0.66.1 // indirect
 	github.com/prometheus/procfs v0.16.1 // indirect
 	github.com/spf13/cobra v1.10.2 // indirect

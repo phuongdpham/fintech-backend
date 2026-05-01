@@ -72,6 +72,11 @@ func main() {
 	log := newLogger(cfg.LogLevel)
 	slog.SetDefault(log)
 
+	// Apply runtime limits before anything allocates significantly.
+	// GOMEMLIMIT from cgroup smooths GC behavior under load; GOGC=200
+	// trades heap for fewer GC cycles. Both overridable via env.
+	observability.ApplyRuntimeLimits(log)
+
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
