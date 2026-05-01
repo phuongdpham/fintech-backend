@@ -1,9 +1,9 @@
 package usecase
 
 import (
-	"encoding/json"
 	"fmt"
 
+	json "github.com/goccy/go-json"
 	"github.com/google/uuid"
 
 	"github.com/phuongdpham/fintech/apps/ledger-svc/internal/domain"
