@@ -219,6 +219,7 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 	breaker := repository.NewBreaker(breakerCfg)
 	ledgerRepo := repository.NewLedgerRepo(requestPool, requestPoolCfg, acquireMetrics).WithBreaker(breaker)
 	outboxRepo := repository.NewOutboxRepo(workerPool, workerPoolCfg, acquireMetrics)
+	auditDrainRepo := repository.NewAuditDrainRepo(workerPool, workerPoolCfg, acquireMetrics)
 
 	// Infrastructure adapters.
 	idemStore := infrastructure.NewRedisIdempotencyStore(redisClient)
@@ -240,6 +241,19 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 	defer stopWorker()
 	worker.Run(workerCtx)
 	log.Info("outbox worker started", slog.Int("concurrency", cfg.Outbox.Workers))
+
+	// Audit drain worker — single writer that turns audit_pending rows
+	// into chained audit_log rows. The request path enqueues into
+	// audit_pending atomic with the ledger write; this worker is the
+	// only thing that touches audit_log. Single-writer is by design:
+	// per-tenant chain integrity needs a single owner of the chain head.
+	auditWorker := infrastructure.NewAuditWorker(auditDrainRepo, infrastructure.AuditWorkerConfig{
+		BatchSize: cfg.Audit.BatchSize,
+	}, log).
+		WithLagGauge(metrics.AuditPendingLagSeconds).
+		WithDrainCounter(metrics.AuditDrainedTotal)
+	auditWorker.Run(workerCtx)
+	log.Info("audit worker started", slog.Int("batch_size", cfg.Audit.BatchSize))
 
 	// gRPC transport. ledger-svc is internal-only; the BFF validates the
 	// caller's JWT and forwards the resolved actor identity as headers
@@ -319,6 +333,9 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 	stopWorker()
 	worker.Wait()
 	log.Info("outbox worker stopped")
+
+	auditWorker.Wait()
+	log.Info("audit worker stopped")
 
 	return nil
 }

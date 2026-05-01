@@ -44,6 +44,7 @@ type Config struct {
 	Redis     RedisConfig
 	Kafka     KafkaConfig
 	Outbox    OutboxConfig
+	Audit     AuditConfig
 	OTel      OTelConfig
 }
 
@@ -136,6 +137,15 @@ type OutboxConfig struct {
 	Workers int    `env:"OUTBOX_WORKERS" envDefault:"4"`
 }
 
+// AuditConfig — async-audit drain worker. Single writer by design (per-
+// tenant chain head ownership), so no fleet-size knob; only the per-tx
+// batch size, which trades commit overhead amortization vs. per-row
+// latency. 1000 keeps a 10K-TPS write path at ~10 commits/s with
+// sub-100ms steady-state lag.
+type AuditConfig struct {
+	BatchSize int `env:"AUDIT_BATCH_SIZE" envDefault:"1000"`
+}
+
 // OTelConfig — OpenTelemetry knobs. Zero-valued Endpoint installs the
 // no-op tracer (zero overhead); see internal/observability.
 type OTelConfig struct {
@@ -221,6 +231,13 @@ func (c *Config) Validate() error {
 	if c.DB.WorkerMaxConns < 2 {
 		errs = append(errs, fmt.Errorf(
 			"DATABASE_WORKER_MAX_CONNS must be >= 2 (got %d)", c.DB.WorkerMaxConns))
+	}
+	// Audit batch size: <100 wastes commit overhead at 10K TPS,
+	// >10000 risks tx-too-large on contention with concurrent ledger
+	// writes. The window is generous; both ends signal misconfig.
+	if c.Audit.BatchSize < 100 || c.Audit.BatchSize > 10000 {
+		errs = append(errs, fmt.Errorf(
+			"AUDIT_BATCH_SIZE must be in [100, 10000] (got %d)", c.Audit.BatchSize))
 	}
 	if c.OTel.Sampler == "traceidratio" || c.OTel.Sampler == "parentbased_traceidratio" {
 		if c.OTel.SamplerArg < 0 || c.OTel.SamplerArg > 1 {

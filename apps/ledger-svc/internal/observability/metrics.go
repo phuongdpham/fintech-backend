@@ -67,6 +67,16 @@ type Metrics struct {
 	// One time series per (tenant, method) — bound at the source by the
 	// closed method set and tier-bucketed tenants.
 	DBCircuitState *prometheus.GaugeVec
+
+	// AuditPendingLagSeconds — gauge of the oldest audit_pending row's
+	// age. The async-audit SLO lives on this metric: alert when it
+	// crosses the agreed bound (typical: page at >60s, warn at >10s).
+	// Worker refreshes on idle ticks; a stale gauge is itself a signal.
+	AuditPendingLagSeconds prometheus.Gauge
+	// AuditDrainedTotal — counter of rows successfully forwarded from
+	// audit_pending into audit_log. Useful for "is the worker actually
+	// running" panels and drain-rate dashboards.
+	AuditDrainedTotal prometheus.Counter
 }
 
 // NewMetrics constructs the metric handles and registers them on a
@@ -134,11 +144,20 @@ func NewMetrics() *Metrics {
 			},
 			[]string{"tenant", "method"},
 		),
+		AuditPendingLagSeconds: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "audit_pending_lag_seconds",
+			Help: "Age (seconds) of the oldest row in audit_pending; 0 when drained.",
+		}),
+		AuditDrainedTotal: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "audit_drained_total",
+			Help: "Rows forwarded from audit_pending into audit_log.",
+		}),
 	}
 	reg.MustRegister(
 		m.PoolAcquireWait, m.PoolAcquired, m.PoolIdle,
 		m.RateLimitRejected, m.AdmissionRejected, m.AdmissionInFlight,
 		m.DBTxOutcomes, m.DBCircuitState,
+		m.AuditPendingLagSeconds, m.AuditDrainedTotal,
 	)
 	return m
 }

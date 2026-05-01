@@ -23,6 +23,7 @@ func clearAll(t *testing.T) {
 		"REDIS_URL",
 		"KAFKA_BROKERS", "KAFKA_CLIENT_ID",
 		"OUTBOX_TOPIC", "OUTBOX_WORKERS",
+		"AUDIT_BATCH_SIZE",
 		"OTEL_EXPORTER_OTLP_ENDPOINT", "OTEL_EXPORTER_OTLP_INSECURE",
 		"OTEL_SERVICE_NAME", "OTEL_SERVICE_VERSION",
 		"OTEL_TRACES_SAMPLER", "OTEL_TRACES_SAMPLER_ARG",
@@ -111,6 +112,7 @@ func TestLoad_Defaults(t *testing.T) {
 		{"Kafka.Brokers", cfg.Kafka.BootstrapServers(), "localhost:9092"},
 		{"Outbox.Topic", cfg.Outbox.Topic, "fintech.ledger.transactions"},
 		{"Outbox.Workers", cfg.Outbox.Workers, 4},
+		{"Audit.BatchSize", cfg.Audit.BatchSize, 1000},
 		{"OTel.ServiceName", cfg.OTel.ServiceName, "ledger-svc"},
 		{"OTel.Sampler", cfg.OTel.Sampler, "always_on"},
 	}
@@ -202,6 +204,7 @@ func TestValidate_CrossField(t *testing.T) {
 			c := &Config{
 				Outbox: OutboxConfig{Workers: 4},
 				DB:     DBConfig{MaxConns: 20, MinConns: 4, AcquireTimeout: 500 * time.Millisecond, WorkerAcquireTimeout: 30 * time.Second, WorkerMaxConns: 8},
+				Audit:  AuditConfig{BatchSize: 1000},
 				OTel:   OTelConfig{Sampler: "always_on", SamplerArg: 0.1},
 			}
 			tc.mutate(c)
@@ -220,6 +223,7 @@ func TestValidate_OK(t *testing.T) {
 	c := &Config{
 		Outbox: OutboxConfig{Workers: 4},
 		DB:     DBConfig{MaxConns: 20, MinConns: 4, AcquireTimeout: 500 * time.Millisecond, WorkerAcquireTimeout: 30 * time.Second, WorkerMaxConns: 8},
+		Audit:  AuditConfig{BatchSize: 1000},
 		OTel:   OTelConfig{Sampler: "always_on"},
 	}
 	if err := c.Validate(); err != nil {
@@ -245,6 +249,7 @@ func TestValidate_AcquireTimeoutBounds(t *testing.T) {
 			c := &Config{
 				Outbox: OutboxConfig{Workers: 4},
 				DB:     DBConfig{MaxConns: 20, MinConns: 4, AcquireTimeout: tc.val, WorkerAcquireTimeout: 30 * time.Second, WorkerMaxConns: 8},
+				Audit:  AuditConfig{BatchSize: 1000},
 				OTel:   OTelConfig{Sampler: "always_on"},
 			}
 			err := c.Validate()
