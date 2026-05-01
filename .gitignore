@@ -14,6 +14,13 @@ coverage/
 *.dylib
 *.test
 *.out
+# Stray `go build` outputs in service dirs (e.g. apps/<svc>/<svc>) when
+# someone forgets the -o flag. The Nx targets all use -o ../../dist/...,
+# so these only ever appear by accident.
+apps/*/server
+apps/*/reconciler
+apps/*/migrate
+apps/*/loadtest
 
 # Env files — only .example variants are committed
 .env
