@@ -38,6 +38,7 @@ type Config struct {
 
 	GRPC      GRPCConfig
 	Metrics   MetricsConfig
+	Admission AdmissionConfig
 	RateLimit RateLimitConfig
 	DB        DBConfig
 	Redis     RedisConfig
@@ -57,6 +58,14 @@ type GRPCConfig struct {
 // out-of-band.
 type MetricsConfig struct {
 	Addr string `env:"METRICS_ADDR" envDefault:":9100"`
+}
+
+// AdmissionConfig — global in-flight cap. Zero / negative MaxInFlight
+// disables the interceptor. Default sized at 2× pgxpool MaxConns
+// (computed at boot in main.go).
+type AdmissionConfig struct {
+	Enabled     bool  `env:"GRPC_ADMISSION_ENABLED"      envDefault:"true"`
+	MaxInFlight int64 `env:"GRPC_ADMISSION_MAX_INFLIGHT" envDefault:"0"`
 }
 
 // RateLimitConfig — per-tenant token-bucket throttle.

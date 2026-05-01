@@ -225,6 +225,21 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 			PublicMethods: interceptors.DefaultPublicMethods(),
 		},
 	}
+	if cfg.Admission.Enabled {
+		max := cfg.Admission.MaxInFlight
+		if max <= 0 {
+			// Default: 2× the effective pool ceiling. Lets bursts absorb
+			// without queueing past the pgxpool wait depth.
+			max = int64(poolCfg.MaxConns) * 2
+		}
+		admCfg := interceptors.AdmissionConfig{
+			MaxInFlight:     max,
+			MetricsRejected: metrics.AdmissionRejected,
+			MetricsInFlight: metrics.AdmissionInFlight,
+		}
+		serverCfg.Admission = &admCfg
+		log.Info("admission cap enabled", slog.Int64("max_inflight", max))
+	}
 	if cfg.RateLimit.Enabled {
 		rlCfg := interceptors.DefaultRateLimitConfig()
 		rlCfg.TierByTenant = interceptors.ParseTierMap(cfg.RateLimit.TenantTierMap)

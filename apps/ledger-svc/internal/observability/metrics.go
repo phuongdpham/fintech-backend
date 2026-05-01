@@ -52,6 +52,13 @@ type Metrics struct {
 	// (configurable via TIER_MAP), tier is from a closed set, method
 	// is closed by the proto.
 	RateLimitRejected *prometheus.CounterVec
+
+	// AdmissionRejected — counter of in-flight-cap rejections. Method
+	// label is closed by the proto.
+	AdmissionRejected *prometheus.CounterVec
+	// AdmissionInFlight — gauge of currently admitted RPCs. Useful
+	// for "are we sustained at capacity" dashboards.
+	AdmissionInFlight prometheus.Gauge
 }
 
 // NewMetrics constructs the metric handles and registers them on a
@@ -94,8 +101,22 @@ func NewMetrics() *Metrics {
 			},
 			[]string{"tenant", "method", "tier"},
 		),
+		AdmissionRejected: prometheus.NewCounterVec(
+			prometheus.CounterOpts{
+				Name: "grpc_admission_rejected_total",
+				Help: "RPCs rejected by the global in-flight admission cap.",
+			},
+			[]string{"method"},
+		),
+		AdmissionInFlight: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "grpc_admission_inflight",
+			Help: "Current number of admitted (in-flight) RPCs.",
+		}),
 	}
-	reg.MustRegister(m.PoolAcquireWait, m.PoolAcquired, m.PoolIdle, m.RateLimitRejected)
+	reg.MustRegister(
+		m.PoolAcquireWait, m.PoolAcquired, m.PoolIdle,
+		m.RateLimitRejected, m.AdmissionRejected, m.AdmissionInFlight,
+	)
 	return m
 }
 

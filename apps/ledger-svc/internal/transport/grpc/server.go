@@ -30,6 +30,9 @@ type ServerConfig struct {
 	// (no rate limiting). When provided, slots in chain after
 	// EdgeIdentity so it can read Claims.Tenant.
 	RateLimit *interceptors.RateLimitConfig
+	// Admission is optional. When provided, slots BEFORE RateLimit
+	// (cheaper to reject early). Caps total in-flight RPCs.
+	Admission *interceptors.AdmissionConfig
 }
 
 func defaultServerConfig() ServerConfig {
@@ -92,8 +95,14 @@ func New(cfg ServerConfig, handler pb.LedgerServiceServer, log *slog.Logger) (*S
 		interceptors.Recovery(log),
 		interceptors.RequestID(),
 		interceptors.Logging(log),
-		interceptors.EdgeIdentity(cfg.EdgeIdentity),
 	}
+	if cfg.Admission != nil {
+		// Admission slots BEFORE EdgeIdentity so a saturated server
+		// rejects before doing any per-request identity work — cheaper
+		// to fail than to parse headers and only then run out of room.
+		intChain = append(intChain, interceptors.Admission(*cfg.Admission))
+	}
+	intChain = append(intChain, interceptors.EdgeIdentity(cfg.EdgeIdentity))
 	if cfg.RateLimit != nil {
 		intChain = append(intChain, interceptors.RateLimit(*cfg.RateLimit, log))
 	}
