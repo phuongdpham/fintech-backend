@@ -219,16 +219,22 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 	// just trusts and parses those — service-mesh / network policy is
 	// what keeps non-BFF callers out, not anything in this process.
 	handler := transportgrpc.NewLedgerHandler(transferUC, ledgerRepo, log)
-	srv, err := transportgrpc.New(
-		transportgrpc.ServerConfig{
-			Addr: cfg.GRPC.Addr,
-			EdgeIdentity: interceptors.EdgeIdentityConfig{
-				PublicMethods: interceptors.DefaultPublicMethods(),
-			},
+	serverCfg := transportgrpc.ServerConfig{
+		Addr: cfg.GRPC.Addr,
+		EdgeIdentity: interceptors.EdgeIdentityConfig{
+			PublicMethods: interceptors.DefaultPublicMethods(),
 		},
-		handler,
-		log,
-	)
+	}
+	if cfg.RateLimit.Enabled {
+		rlCfg := interceptors.DefaultRateLimitConfig()
+		rlCfg.TierByTenant = interceptors.ParseTierMap(cfg.RateLimit.TenantTierMap)
+		rlCfg.MetricsRejected = metrics.RateLimitRejected
+		serverCfg.RateLimit = &rlCfg
+		log.Info("rate limit enabled",
+			slog.Int("tier_map_entries", len(rlCfg.TierByTenant)),
+		)
+	}
+	srv, err := transportgrpc.New(serverCfg, handler, log)
 	if err != nil {
 		return fmt.Errorf("grpc server: %w", err)
 	}

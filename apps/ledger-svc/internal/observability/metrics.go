@@ -46,6 +46,12 @@ type Metrics struct {
 	// PoolIdle — gauge of idle connections. PoolAcquired+PoolIdle ≤
 	// MaxConns; the gap is "connections being created."
 	PoolIdle prometheus.Gauge
+
+	// RateLimitRejected — counter of per-tenant rate-limit rejections.
+	// Labels bounded: tenant cardinality matches the active tenant set
+	// (configurable via TIER_MAP), tier is from a closed set, method
+	// is closed by the proto.
+	RateLimitRejected *prometheus.CounterVec
 }
 
 // NewMetrics constructs the metric handles and registers them on a
@@ -81,8 +87,15 @@ func NewMetrics() *Metrics {
 			Name: "pgxpool_idle_conns",
 			Help: "Current number of idle Postgres connections in the pool.",
 		}),
+		RateLimitRejected: prometheus.NewCounterVec(
+			prometheus.CounterOpts{
+				Name: "grpc_ratelimit_rejected_total",
+				Help: "Per-tenant rate-limit rejections.",
+			},
+			[]string{"tenant", "method", "tier"},
+		),
 	}
-	reg.MustRegister(m.PoolAcquireWait, m.PoolAcquired, m.PoolIdle)
+	reg.MustRegister(m.PoolAcquireWait, m.PoolAcquired, m.PoolIdle, m.RateLimitRejected)
 	return m
 }
 

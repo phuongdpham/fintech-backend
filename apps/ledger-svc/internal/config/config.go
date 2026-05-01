@@ -36,13 +36,14 @@ type Config struct {
 	AppEnv   string `env:"APP_ENV"   envDefault:"development"`
 	LogLevel string `env:"LOG_LEVEL" envDefault:"info"`
 
-	GRPC    GRPCConfig
-	Metrics MetricsConfig
-	DB      DBConfig
-	Redis   RedisConfig
-	Kafka   KafkaConfig
-	Outbox  OutboxConfig
-	OTel    OTelConfig
+	GRPC      GRPCConfig
+	Metrics   MetricsConfig
+	RateLimit RateLimitConfig
+	DB        DBConfig
+	Redis     RedisConfig
+	Kafka     KafkaConfig
+	Outbox    OutboxConfig
+	OTel      OTelConfig
 }
 
 // GRPCConfig — gRPC server transport knobs.
@@ -56,6 +57,17 @@ type GRPCConfig struct {
 // out-of-band.
 type MetricsConfig struct {
 	Addr string `env:"METRICS_ADDR" envDefault:":9100"`
+}
+
+// RateLimitConfig — per-tenant token-bucket throttle.
+//
+// TenantTierMap is the env-format string "tenant-a:premium,tenant-b:standard"
+// mapping individual tenant ids to tier labels. The tiers themselves
+// (default/premium/internal) are hardcoded in the interceptor; only the
+// per-tenant assignment is operator-tunable here.
+type RateLimitConfig struct {
+	Enabled       bool   `env:"GRPC_RATELIMIT_ENABLED"  envDefault:"true"`
+	TenantTierMap string `env:"GRPC_RATELIMIT_TIER_MAP" envDefault:""`
 }
 
 // DBConfig — Postgres pool sizing.

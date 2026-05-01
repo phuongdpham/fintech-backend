@@ -26,6 +26,10 @@ type ServerConfig struct {
 	MaxRecvMsgSize int           // default 4MiB; override for large bulk RPCs
 	KeepaliveTime  time.Duration // server-side ping every N (default 30s)
 	EdgeIdentity   interceptors.EdgeIdentityConfig
+	// RateLimit is optional. Leave zero-value to skip the interceptor
+	// (no rate limiting). When provided, slots in chain after
+	// EdgeIdentity so it can read Claims.Tenant.
+	RateLimit *interceptors.RateLimitConfig
 }
 
 func defaultServerConfig() ServerConfig {
@@ -84,12 +88,16 @@ func New(cfg ServerConfig, handler pb.LedgerServiceServer, log *slog.Logger) (*S
 	if cfg.EdgeIdentity.PublicMethods == nil {
 		cfg.EdgeIdentity.PublicMethods = interceptors.DefaultPublicMethods()
 	}
-	chain := gogrpc.ChainUnaryInterceptor(
+	intChain := []gogrpc.UnaryServerInterceptor{
 		interceptors.Recovery(log),
 		interceptors.RequestID(),
 		interceptors.Logging(log),
 		interceptors.EdgeIdentity(cfg.EdgeIdentity),
-	)
+	}
+	if cfg.RateLimit != nil {
+		intChain = append(intChain, interceptors.RateLimit(*cfg.RateLimit, log))
+	}
+	chain := gogrpc.ChainUnaryInterceptor(intChain...)
 
 	srv := gogrpc.NewServer(
 		chain,
