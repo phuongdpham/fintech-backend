@@ -1,0 +1,98 @@
+# Load-test compose overlay. Use as:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.load.yml up -d
+#
+# Or via the Makefile target:
+#
+#   make stack-up-load
+#
+# What this overlay changes vs the dev base profile:
+#
+#   * Postgres mounts postgresql-load.conf (4GB shared_buffers, 8GB WAL
+#     ceiling, 400 max_connections, AIO 8 workers, autovacuum tuned for
+#     write-heavy workload).
+#   * Resource ceilings raised to match the new workload — leaving the
+#     dev limits in place would have the OOM killer hit before the load
+#     test finishes ramping.
+#   * Redis 8GB cache, multi-threaded I/O (single-thread Redis tops out
+#     ~100K ops/s; we don't need that, but io-threads cuts tail latency
+#     under bursty Acquire from 200 concurrent goroutines).
+#   * Redpanda jumps from 512MB / single-core dev mode to 4GB / 4 cores.
+#     At 10K events/sec the original sizing OOMs within minutes.
+#
+# What this overlay does NOT do:
+#
+#   * Swap the postgres image for a non-alpine variant. alpine is fine
+#     for load tests; if the kernel disagrees on DNS resolution you'd
+#     swap to debian-bookworm-slim, but that's a separate problem.
+#   * Move pgdata to a host-bind on a fast SSD. If your default docker
+#     volume driver is on slow storage, that's the bottleneck no
+#     amount of conf tuning fixes — symptom is sustained checkpoint
+#     pressure showing in pg_stat_bgwriter. Override via:
+#
+#         volumes:
+#           postgres:
+#             driver_opts:
+#               type: none
+#               device: /mnt/nvme/pgdata
+#               o: bind
+#
+#     in a personal override file rather than committing host paths.
+
+services:
+  postgres:
+    volumes:
+      # Replace the dev config mount with the load profile.
+      - pgdata:/var/lib/postgresql
+      - ./postgresql-load.conf:/etc/postgresql/postgresql.conf
+    # Postgres 18's tuned shared_buffers (4GB) needs ≥ shared_buffers
+    # plus WAL + worker + per-conn overhead. 8GB is the floor; if
+    # shared_buffers grows to 8GB later, double this too.
+    deploy:
+      resources:
+        limits:
+          memory: 8G
+          cpus: '8.0'
+    # SHM is where shared_buffers lives. Default 64MB inside the
+    # container — too small for shared_buffers=4GB. Without this,
+    # Postgres fails to start with "could not resize shared memory
+    # segment".
+    shm_size: 4gb
+
+  redis:
+    command: >
+      redis-server
+      --maxmemory 8gb
+      --maxmemory-policy allkeys-lru
+      --save ""
+      --appendonly no
+      --io-threads 4
+      --io-threads-do-reads yes
+      --tcp-backlog 4096
+    deploy:
+      resources:
+        limits:
+          memory: 9G
+          cpus: '4.0'
+
+  redpanda:
+    command:
+      - redpanda
+      - start
+      - --mode=dev-container
+      - --smp=4
+      - --memory=4G
+      - --reserve-memory=0M
+      - --overprovisioned
+      - --kafka-addr=PLAINTEXT://0.0.0.0:9092
+      - --advertise-kafka-addr=PLAINTEXT://localhost:9092
+    deploy:
+      resources:
+        limits:
+          memory: 6G
+          cpus: '4.0'
+
+# Pinning the volume here keeps the load overlay self-contained;
+# docker compose merges this with the base file's `volumes:` block.
+volumes:
+  pgdata:

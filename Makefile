@@ -23,7 +23,8 @@ include .env
 export
 endif
 
-COMPOSE := docker compose
+COMPOSE      := docker compose
+COMPOSE_LOAD := docker compose -f docker-compose.yml -f docker-compose.load.yml
 
 # Auto-discover service directories that define a migrate-up target.
 # Stateless services (no schema of their own) simply omit the target
@@ -65,6 +66,15 @@ proto-gen:  ## Regenerate gRPC stubs from shared/proto
 stack-up: compose-up wait-postgres migrate-all  ## Bring up shared infra + apply all service migrations
 	@echo ""
 	@echo "Stack up. Run a service:  make -C apps/<svc> run-server"
+
+.PHONY: stack-up-load
+stack-up-load:  ## Bring up shared infra in LOAD-TEST profile (8GB PG, 8GB Redis, 4GB Redpanda)
+	$(COMPOSE_LOAD) up -d postgres redis redpanda
+	@$(MAKE) wait-postgres
+	@$(MAKE) migrate-all
+	@echo ""
+	@echo "Load-test stack up. Run a service:  make -C apps/<svc> run-server"
+	@echo "Or:  make -C apps/ledger-svc loadtest-seed && make -C apps/ledger-svc loadtest-run"
 
 .PHONY: stack-down
 stack-down:  ## Stop and DELETE the docker-compose stack (drops pgdata volume)
