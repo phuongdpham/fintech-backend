@@ -167,6 +167,22 @@ func (r *LedgerRepo) ExecuteTransfer(ctx context.Context, req domain.TransferReq
 	}
 
 	err := InTx(ctx, r.pool, r.acquireCfg, r.retry, r.metrics, func(ctx context.Context, tx pgx.Tx) error {
+		// Per-tenant advisory lock. The audit chain (SELECT latest hash
+		// → compute entry_hash → INSERT) is the dominant SERIALIZABLE
+		// conflict source under concurrent writes for the same tenant —
+		// two transfers race the read-then-insert and one gets a 40001.
+		// Serializing per-tenant via pg_advisory_xact_lock converts that
+		// optimistic-conflict into a row-lock wait. Different tenants
+		// don't block each other; same-tenant writes serialize cleanly.
+		// Lock is released automatically at COMMIT/ROLLBACK.
+		//
+		// hashtextextended → int8 keeps the lock id in advisory_lock's
+		// bigint key space; collision risk is negligible at our tenant
+		// cardinality.
+		if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", req.TenantID); err != nil {
+			return fmt.Errorf("acquire tenant audit lock: %w", err)
+		}
+
 		if _, err := tx.Exec(ctx, insertTransactionSQL,
 			transaction.ID, transaction.TenantID, transaction.IdempotencyKey,
 			transaction.RequestFingerprint,
