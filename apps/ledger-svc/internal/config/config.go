@@ -38,6 +38,7 @@ type Config struct {
 
 	GRPC      GRPCConfig
 	Metrics   MetricsConfig
+	Profiling ProfilingConfig
 	Admission AdmissionConfig
 	RateLimit RateLimitConfig
 	DB        DBConfig
@@ -59,6 +60,24 @@ type GRPCConfig struct {
 // out-of-band.
 type MetricsConfig struct {
 	Addr string `env:"METRICS_ADDR" envDefault:":9100"`
+}
+
+// ProfilingConfig — pprof + runtime profiler knobs.
+//
+// pprof handlers (/debug/pprof/*) are mounted on the metrics listener
+// when Enabled. They have ~zero overhead when nobody is hitting them,
+// so leaving on in dev is fine. In production keep the metrics port
+// bound to localhost or behind ingress auth — pprof can leak memory
+// contents (idempotency keys, payloads) if exposed publicly.
+//
+// BlockProfileRate / MutexProfileFraction enable runtime collection
+// for the block and mutex profiles. Both add measurable overhead
+// (3–5% CPU at rate=1) — only enable when actively profiling.
+// Setting either to 0 disables that profile entirely.
+type ProfilingConfig struct {
+	Enabled              bool `env:"PPROF_ENABLED"               envDefault:"false"`
+	BlockProfileRate     int  `env:"PPROF_BLOCK_PROFILE_RATE"    envDefault:"0"` // 1=every event, 100=sample
+	MutexProfileFraction int  `env:"PPROF_MUTEX_PROFILE_FRACTION" envDefault:"0"`
 }
 
 // AdmissionConfig — global in-flight cap. Zero / negative MaxInFlight

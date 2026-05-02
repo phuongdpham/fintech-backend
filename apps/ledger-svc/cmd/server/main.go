@@ -16,8 +16,10 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/http/pprof"
 	"os"
 	"os/signal"
+	"runtime"
 	"syscall"
 	"time"
 
@@ -124,7 +126,15 @@ func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 	metrics := observability.NewMetrics()
 	acquireMetrics := repository.PromAcquireMetrics{Wait: metrics.PoolAcquireWait}
 
-	metricsServer, metricsShutdown, err := startMetricsServer(cfg.Metrics.Addr, metrics.Handler(), log)
+	// Apply runtime profile collection rates BEFORE the metrics server
+	// boots so any pprof scrape that hits /debug/pprof/block or
+	// /debug/pprof/mutex sees populated data. Both rates are 0 (off) by
+	// default; turning them up has measurable overhead so they're
+	// gated by env flags meant for active profiling sessions only.
+	applyRuntimeProfilingRates(cfg.Profiling, log)
+
+	metricsServer, metricsShutdown, err := startMetricsServer(
+		cfg.Metrics.Addr, metrics.Handler(), cfg.Profiling.Enabled, log)
 	if err != nil {
 		return fmt.Errorf("metrics server: %w", err)
 	}
@@ -374,11 +384,40 @@ func newLogger(level string) *slog.Logger {
 	return slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: lvl}))
 }
 
+// applyRuntimeProfilingRates flips on the runtime's block + mutex
+// profile collectors when configured. Both have measurable overhead
+// at rate=1 (~3–5% CPU under contention) — left at 0 in production
+// and bumped only during active profiling sessions.
+//
+// Setting either to 0 explicitly disables the corresponding profile;
+// /debug/pprof/block or /debug/pprof/mutex will still respond but
+// the data will be empty.
+func applyRuntimeProfilingRates(cfg config.ProfilingConfig, log *slog.Logger) {
+	if cfg.BlockProfileRate > 0 {
+		runtime.SetBlockProfileRate(cfg.BlockProfileRate)
+		log.Info("block profile collection enabled",
+			slog.Int("rate", cfg.BlockProfileRate))
+	}
+	if cfg.MutexProfileFraction > 0 {
+		runtime.SetMutexProfileFraction(cfg.MutexProfileFraction)
+		log.Info("mutex profile collection enabled",
+			slog.Int("fraction", cfg.MutexProfileFraction))
+	}
+}
+
 // startMetricsServer starts an HTTP listener that serves Prometheus
-// exposition at /metrics. Returns the bound address (helpful when addr
-// is `:0` in tests), a shutdown closure, or an error if the listener
-// can't bind. Empty addr disables the server (returns no-op shutdown).
-func startMetricsServer(addr string, h http.Handler, log *slog.Logger) (string, func(), error) {
+// exposition at /metrics, a /healthz probe, and (when pprof is enabled)
+// the /debug/pprof/* handlers. Returns the bound address (helpful when
+// addr is `:0` in tests), a shutdown closure, or an error if the
+// listener can't bind. Empty addr disables the server (returns no-op
+// shutdown).
+//
+// pprof is mounted on the same listener as /metrics on purpose — both
+// are admin surfaces, both want the same network policy. Production
+// deployments should bind METRICS_ADDR to localhost or gate this
+// listener behind ingress auth; pprof can leak memory contents if
+// exposed publicly.
+func startMetricsServer(addr string, h http.Handler, pprofEnabled bool, log *slog.Logger) (string, func(), error) {
 	if addr == "" {
 		return "", func() {}, nil
 	}
@@ -387,6 +426,20 @@ func startMetricsServer(addr string, h http.Handler, log *slog.Logger) (string, 
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	})
+	if pprofEnabled {
+		// Standard net/http/pprof mountpoints. The Index handler at
+		// the trailing-slash path serves the menu page + handles the
+		// per-profile sub-routes (heap, goroutine, allocs, etc.).
+		// Profile, Trace, Symbol, Cmdline are explicit because they
+		// don't auto-register on a non-default mux.
+		mux.HandleFunc("/debug/pprof/", pprof.Index)
+		mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+		mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+		mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+		mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+		log.Info("pprof handlers mounted",
+			slog.String("addr", addr+"/debug/pprof/"))
+	}
 	srv := &http.Server{
 		Addr:              addr,
 		Handler:           mux,

@@ -130,6 +130,92 @@ loadtest-run:  ## Run the k6 scenario (requires k6 + loadtest-seed first)
 		-e ADDR=$${LOADTEST_ADDR:-localhost:9090} \
 		-e PROTO_DIR=shared/proto
 
+##@ Profile (pprof)
+# Capture targets dump profiles to ./profiles/ with a timestamp so
+# multiple runs don't clobber each other. Use the matching analyze-*
+# target to open the latest in `go tool pprof`'s web UI (Graphviz
+# required: pacman -S graphviz).
+#
+# All targets assume PPROF_ENABLED=true and METRICS_ADDR points at
+# localhost:9100 (the .env.example defaults). For block / mutex
+# profiles to be useful, also set PPROF_BLOCK_PROFILE_RATE=1 and/or
+# PPROF_MUTEX_PROFILE_FRACTION=1 in the env BEFORE the server boots —
+# overhead is real (~3–5% CPU) so flip back to 0 when done.
+PPROF_ADDR    ?= localhost:9100
+PPROF_DIR     := $(SVC_DIR)/profiles
+PPROF_SECONDS ?= 30
+PPROF_STAMP   := $(shell date +%Y%m%d-%H%M%S)
+
+$(PPROF_DIR):
+	mkdir -p $(PPROF_DIR)
+
+.PHONY: profile-cpu
+profile-cpu: $(PPROF_DIR)  ## Capture a CPU profile (default 30s); writes profiles/cpu-<ts>.pb.gz
+	@echo "capturing CPU profile for $(PPROF_SECONDS)s..."
+	curl -fsS -o $(PPROF_DIR)/cpu-$(PPROF_STAMP).pb.gz \
+		"http://$(PPROF_ADDR)/debug/pprof/profile?seconds=$(PPROF_SECONDS)"
+	@echo "wrote $(PPROF_DIR)/cpu-$(PPROF_STAMP).pb.gz"
+
+.PHONY: profile-heap
+profile-heap: $(PPROF_DIR)  ## Capture an in-use heap profile; writes profiles/heap-<ts>.pb.gz
+	curl -fsS -o $(PPROF_DIR)/heap-$(PPROF_STAMP).pb.gz \
+		"http://$(PPROF_ADDR)/debug/pprof/heap"
+	@echo "wrote $(PPROF_DIR)/heap-$(PPROF_STAMP).pb.gz"
+
+.PHONY: profile-allocs
+profile-allocs: $(PPROF_DIR)  ## Capture an allocations profile (since process start)
+	curl -fsS -o $(PPROF_DIR)/allocs-$(PPROF_STAMP).pb.gz \
+		"http://$(PPROF_ADDR)/debug/pprof/allocs"
+	@echo "wrote $(PPROF_DIR)/allocs-$(PPROF_STAMP).pb.gz"
+
+.PHONY: profile-block
+profile-block: $(PPROF_DIR)  ## Capture a block profile (needs PPROF_BLOCK_PROFILE_RATE>0)
+	curl -fsS -o $(PPROF_DIR)/block-$(PPROF_STAMP).pb.gz \
+		"http://$(PPROF_ADDR)/debug/pprof/block"
+	@echo "wrote $(PPROF_DIR)/block-$(PPROF_STAMP).pb.gz"
+	@echo "  (empty profile = PPROF_BLOCK_PROFILE_RATE was 0 at boot)"
+
+.PHONY: profile-mutex
+profile-mutex: $(PPROF_DIR)  ## Capture a mutex contention profile (needs PPROF_MUTEX_PROFILE_FRACTION>0)
+	curl -fsS -o $(PPROF_DIR)/mutex-$(PPROF_STAMP).pb.gz \
+		"http://$(PPROF_ADDR)/debug/pprof/mutex"
+	@echo "wrote $(PPROF_DIR)/mutex-$(PPROF_STAMP).pb.gz"
+	@echo "  (empty profile = PPROF_MUTEX_PROFILE_FRACTION was 0 at boot)"
+
+.PHONY: profile-goroutines
+profile-goroutines: $(PPROF_DIR)  ## Dump full goroutine stacks (text)
+	curl -fsS "http://$(PPROF_ADDR)/debug/pprof/goroutine?debug=2" \
+		> $(PPROF_DIR)/goroutines-$(PPROF_STAMP).txt
+	@echo "wrote $(PPROF_DIR)/goroutines-$(PPROF_STAMP).txt"
+
+.PHONY: profile-trace
+profile-trace: $(PPROF_DIR)  ## Capture an execution trace (default 5s; file is large)
+	@echo "capturing execution trace for $${PPROF_TRACE_SECONDS:-5}s..."
+	curl -fsS -o $(PPROF_DIR)/trace-$(PPROF_STAMP).out \
+		"http://$(PPROF_ADDR)/debug/pprof/trace?seconds=$${PPROF_TRACE_SECONDS:-5}"
+	@echo "wrote $(PPROF_DIR)/trace-$(PPROF_STAMP).out"
+	@echo "open with:  go tool trace $(PPROF_DIR)/trace-$(PPROF_STAMP).out"
+
+.PHONY: profile-analyze-cpu
+profile-analyze-cpu:  ## Open the latest CPU profile in pprof's web UI (port 8888)
+	@latest=$$(ls -t $(PPROF_DIR)/cpu-*.pb.gz 2>/dev/null | head -1); \
+	if [ -z "$$latest" ]; then echo "no CPU profile in $(PPROF_DIR); run profile-cpu first" >&2; exit 1; fi; \
+	echo "opening $$latest"; \
+	go tool pprof -http=:8888 "$$latest"
+
+.PHONY: profile-analyze-heap
+profile-analyze-heap:  ## Open the latest heap profile in pprof's web UI (port 8888)
+	@latest=$$(ls -t $(PPROF_DIR)/heap-*.pb.gz 2>/dev/null | head -1); \
+	if [ -z "$$latest" ]; then echo "no heap profile; run profile-heap first" >&2; exit 1; fi; \
+	echo "opening $$latest"; \
+	go tool pprof -http=:8888 "$$latest"
+
+.PHONY: profile-diff-cpu
+profile-diff-cpu:  ## Diff two CPU profiles (PPROF_BASE=before.pb.gz PPROF_NEW=after.pb.gz)
+	@if [ -z "$(PPROF_BASE)" ] || [ -z "$(PPROF_NEW)" ]; then \
+		echo "usage: make profile-diff-cpu PPROF_BASE=profiles/cpu-X.pb.gz PPROF_NEW=profiles/cpu-Y.pb.gz" >&2; exit 1; fi
+	go tool pprof -http=:8888 -base $(PPROF_BASE) $(PPROF_NEW)
+
 ##@ Smoke
 .PHONY: smoke
 smoke:  ## Print example grpcurl invocations

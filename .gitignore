@@ -26,6 +26,9 @@ apps/*/loadtest
 # (10K tenants × 100 accounts ~= 8MB). Reproduce with the seeder.
 apps/*/load/fixtures.json
 
+# pprof captures — per-developer; reproduce with `make profile-*`.
+apps/*/profiles/
+
 # Env files — only .example variants are committed
 .env
 **/.env
