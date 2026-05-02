@@ -12,6 +12,15 @@
 //       -e FIXTURES=apps/ledger-svc/load/fixtures.json \
 //       -e ADDR=localhost:9090 \
 //       -e PROTO_DIR=shared/proto
+//
+// VU caps default to RPS × 0.1 / 0.2 (sized for p99 ≈ 50ms). Override
+// when running on slower hardware or expecting higher latency:
+//
+//   -e PRE_VUS=1000 -e MAX_VUS=2000
+//
+// Rule of thumb: MAX_VUS ≥ RPS × p99_seconds × 1.5. The "Insufficient
+// VUs" warning means MAX_VUS is too low for the rate the server can
+// actually sustain.
 
 import grpc from 'k6/net/grpc';
 import { check } from 'k6';
@@ -35,9 +44,15 @@ const transferErr     = new Counter('transfer_err_total');
 const RPS      = parseInt(__ENV.RPS || '4000', 10);
 const DURATION = __ENV.DURATION || '4m';
 
-// VU sizing rule of thumb: VUs ≥ RPS × p99_seconds × 1.5. At RPS=4000
-// and p99~50ms expected, that's ~300. preAllocate generously so k6
-// doesn't burn cycles spawning under load.
+// VU sizing rule of thumb: VUs ≥ RPS × p99_seconds × 1.5. Defaults
+// assume p99 ≈ 50ms (load-profile hardware); on slimmer setups p99 is
+// higher (~500ms on the dev compose profile) and the defaults run out
+// — pass PRE_VUS / MAX_VUS to override.
+const PRE_VUS = parseInt(
+  __ENV.PRE_VUS || String(Math.max(300, Math.floor(RPS * 0.1))), 10);
+const MAX_VUS = parseInt(
+  __ENV.MAX_VUS || String(Math.max(600, Math.floor(RPS * 0.2))), 10);
+
 export const options = {
   scenarios: {
     transfer_const: {
@@ -45,8 +60,8 @@ export const options = {
       rate: RPS,
       timeUnit: '1s',
       duration: DURATION,
-      preAllocatedVUs: Math.max(300, Math.floor(RPS * 0.1)),
-      maxVUs: Math.max(600, Math.floor(RPS * 0.2)),
+      preAllocatedVUs: PRE_VUS,
+      maxVUs: MAX_VUS,
     },
   },
   thresholds: {
