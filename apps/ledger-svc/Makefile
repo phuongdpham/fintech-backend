@@ -211,10 +211,16 @@ profile-analyze-heap:  ## Open the latest heap profile in pprof's web UI (port 8
 	go tool pprof -http=:8888 "$$latest"
 
 .PHONY: profile-diff-cpu
-profile-diff-cpu:  ## Diff two CPU profiles (PPROF_BASE=before.pb.gz PPROF_NEW=after.pb.gz)
+profile-diff-cpu:  ## Diff two CPU profiles (PPROF_BASE=path PPROF_NEW=path; absolute, repo-relative, or svc-relative all work)
 	@if [ -z "$(PPROF_BASE)" ] || [ -z "$(PPROF_NEW)" ]; then \
-		echo "usage: make profile-diff-cpu PPROF_BASE=profiles/cpu-X.pb.gz PPROF_NEW=profiles/cpu-Y.pb.gz" >&2; exit 1; fi
-	go tool pprof -http=:8888 -base $(PPROF_BASE) $(PPROF_NEW)
+		echo "usage: make profile-diff-cpu PPROF_BASE=<path> PPROF_NEW=<path>" >&2; \
+		echo "  paths may be absolute, relative to the repo root, or relative to apps/ledger-svc/" >&2; \
+		exit 1; fi
+	@base="$(PPROF_BASE)"; [ -f "$$base" ] || base="$(ROOT)/$(PPROF_BASE)"; \
+	new="$(PPROF_NEW)";  [ -f "$$new" ]  || new="$(ROOT)/$(PPROF_NEW)"; \
+	if [ ! -f "$$base" ]; then echo "PPROF_BASE not found: $(PPROF_BASE)" >&2; exit 1; fi; \
+	if [ ! -f "$$new"  ]; then echo "PPROF_NEW not found:  $(PPROF_NEW)"  >&2; exit 1; fi; \
+	go tool pprof -http=:8888 -base "$$base" "$$new"
 
 ##@ Smoke
 .PHONY: smoke
