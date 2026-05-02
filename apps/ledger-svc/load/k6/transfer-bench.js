@@ -53,6 +53,12 @@ const PRE_VUS = parseInt(
 const MAX_VUS = parseInt(
   __ENV.MAX_VUS || String(Math.max(600, Math.floor(RPS * 0.2))), 10);
 
+// p99 threshold default fits the load-profile compose (4GB PG buffer
+// cache, 8GB container). On the slim base-profile compose (256MB PG
+// buffer cache) p99 lands closer to 500–700ms; pass P99_BUDGET_MS to
+// match. Crossing the threshold is non-fatal but exits k6 non-zero.
+const P99_BUDGET_MS = parseInt(__ENV.P99_BUDGET_MS || '200', 10);
+
 export const options = {
   scenarios: {
     transfer_const: {
@@ -65,7 +71,7 @@ export const options = {
     },
   },
   thresholds: {
-    'transfer_latency_ms{kind:ok}': ['p(99)<200'],
+    'transfer_latency_ms{kind:ok}': [`p(99)<${P99_BUDGET_MS}`],
   },
 };
 
