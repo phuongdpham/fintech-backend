@@ -8,4 +8,6 @@ go 1.26.2
 // fetch from the network and fails.
 require github.com/phuongdpham/fintech/libs/go/logger v0.0.0
 
+require github.com/google/uuid v1.6.0
+
 replace github.com/phuongdpham/fintech/libs/go/logger => ../../libs/go/logger
