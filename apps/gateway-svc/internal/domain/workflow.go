@@ -17,22 +17,33 @@ import (
 	"github.com/google/uuid"
 )
 
-// WorkflowKind enumerates the per-rail state machines. Each kind has
-// its own request shape, state enum, and event vocabulary. Add a new
-// constant here when a new rail (e.g. SEPA, RTP, wire) lands; keep
-// the SQL CHECK constraint in the corresponding migration in sync.
+// WorkflowKind enumerates the BUSINESS-LEVEL workflow categories the
+// gateway drives — not the underlying rails. Card charging is one
+// kind regardless of whether it goes through Stripe or Adyen; an
+// outbound bank transfer is one kind regardless of whether the
+// concrete rail is Singapore PayNow, Vietnam NAPAS, or US ACH.
+//
+// Rail-specific mechanics (PayNow's 5 states, ACH's 7 states with
+// PENDING/RETURNED) live in the infrastructure adapter that
+// implements the corresponding PaymentWorkflow[Req,State]. Adapters
+// translate between the rail's internal sub-states and the
+// domain-level state enum exposed on the workflow.
+//
+// Add a new constant here only when a genuinely new business
+// category lands (e.g. e-wallet charges, QR payments) — not for a
+// new rail under an existing category.
 type WorkflowKind string
 
 const (
-	WorkflowKindCardCharge  WorkflowKind = "card_charge"
-	WorkflowKindACHTransfer WorkflowKind = "ach_transfer"
+	WorkflowKindCardCharge           WorkflowKind = "card_charge"
+	WorkflowKindOutboundBankTransfer WorkflowKind = "outbound_bank_transfer"
 )
 
 // Valid returns true for kinds the gateway knows how to drive.
 // Used by adapters to fail fast on bad input.
 func (k WorkflowKind) Valid() bool {
 	switch k {
-	case WorkflowKindCardCharge, WorkflowKindACHTransfer:
+	case WorkflowKindCardCharge, WorkflowKindOutboundBankTransfer:
 		return true
 	}
 	return false

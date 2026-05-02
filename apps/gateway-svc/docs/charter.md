@@ -159,20 +159,49 @@ to Temporal / Restate / whatever, AND so adding a new rail (Vietnam
 NAPAS, MoMo e-wallet, QRIS) doesn't change the interface — just adds
 a new `WorkflowKind` + per-rail state enum.
 
-### Domain types (already scaffolded)
+### Layering — domain vs infrastructure
+
+The domain layer expresses the **business concept** of a flow. It
+does NOT name concrete rails. "Card charging" is a domain category
+(applies to Stripe, Adyen, 2C2P alike); "outbound bank transfer" is
+a domain category (applies to PayNow, NAPAS, ACH, SEPA alike).
+
+Concrete rails (PayNow, NAPAS, ACH) live in `internal/infrastructure`
+as adapters. Each adapter implements a domain-level
+`PaymentWorkflow[Req,State]` and translates between its rail's
+internal sub-states and the domain-level state enum.
+
+```
+internal/domain/                       internal/infrastructure/
+├─ workflow.go                         ├─ paynow_adapter.go      ─┐
+├─ card_charge.go                      ├─ napas_adapter.go         │ each implements a
+├─ outbound_bank_transfer.go           ├─ ach_adapter.go (parked)  │ domain workflow
+└─ ...                                 ├─ stripe_card_adapter.go ─┘
+                                       └─ ...
+```
+
+This keeps the domain rail-agnostic — adding Vietnam NAPAS or US
+ACH in the future is a new infrastructure adapter, not a new domain
+file. The domain doesn't care that PayNow has 5 internal states and
+ACH has 7; the adapter maps both to the domain's six-state abstract
+machine.
+
+### Domain types (scaffolded)
 
 ```go
 // internal/domain/workflow.go
 
+// WorkflowKind enumerates BUSINESS-LEVEL categories — not concrete
+// rails. Adding a new rail under an existing category does NOT add
+// a new kind here.
 type WorkflowKind string
 
 const (
-    WorkflowKindCardCharge      WorkflowKind = "card_charge"        // v1: Stripe (SG)
-    WorkflowKindPayNowTransfer  WorkflowKind = "paynow_transfer"    // v1: SG outbound
-    // v2 additions:
-    // WorkflowKindNAPASTransfer  — Vietnam bank-to-bank
-    // WorkflowKindEWalletCharge  — MoMo/GrabPay/GoPay/etc.
-    // WorkflowKindQRPayment      — QRIS/VietQR/PromptPay
+    WorkflowKindCardCharge           WorkflowKind = "card_charge"
+    WorkflowKindOutboundBankTransfer WorkflowKind = "outbound_bank_transfer"
+    // v2 additions (genuinely new categories, not new rails):
+    // WorkflowKindEWalletCharge   — MoMo / GrabPay / GoPay / DANA / OVO …
+    // WorkflowKindQRPayment       — PayNow QR / VietQR / QRIS / PromptPay QR …
 )
 
 type WorkflowID struct {
@@ -190,10 +219,9 @@ type PaymentWorkflow[Req, State any] interface {
 }
 ```
 
-Already shipped in `internal/domain/workflow.go` (commit `6f227d1`).
-The interface is rail-agnostic — adding NAPAS or MoMo in v2 means
-defining new request + state types and a new typed alias, not
-changing this file.
+Shipped in `internal/domain/workflow.go`. The interface is
+rail-agnostic — adding NAPAS or MoMo in v2 means a new
+infrastructure adapter, not a domain change.
 
 ### Per-kind concretizations — v1
 
@@ -229,36 +257,47 @@ type CardChargeWorkflow = PaymentWorkflow[CardChargeRequest, CardChargeState]
 ```
 
 ```go
-// internal/domain/paynow_transfer.go (REPLACES ach_transfer.go in v1)
+// internal/domain/outbound_bank_transfer.go — rail-agnostic.
 
-type PayNowTransferRequest struct {
-    TenantID            string
-    IdempotencyKey      string
-    UserAccountID       uuid.UUID
-    Amount              Amount
-    Currency            Currency       // SGD for v1
-    DestinationProxy    string         // PayNow proxy: NRIC / UEN / mobile / VPA
-    DestinationProxyKind string        // 'nric' | 'uen' | 'mobile' | 'vpa'
-    LedgerTransferID    uuid.UUID
+type OutboundBankTransferRequest struct {
+    TenantID         string
+    IdempotencyKey   string
+    UserAccountID    uuid.UUID
+    LedgerTransferID uuid.UUID
+    Amount           Amount
+    Currency         Currency       // SGD for v1
+    Country          string         // ISO-3166: 'SG' for v1; drives rail selection
+    Destination      OutboundDestination
 }
 
-type PayNowTransferState string
+type OutboundDestination struct {
+    Kind  string  // e.g. 'paynow_proxy', 'bank_account', 'napas_account', 'iban'
+    Token string  // tokenized recipient identifier; opaque from domain POV
+}
+
+// Six abstract states. Rail adapters map their internal sub-states
+// to these (PayNow's INITIATED/SUBMITTED collapse to REQUESTED/IN_FLIGHT;
+// ACH's PENDING extends IN_FLIGHT; ACH's RETURNED maps to REVERSED).
+type OutboundBankTransferState string
 
 const (
-    PayNowInitiated PayNowTransferState = "INITIATED"
-    PayNowSubmitted PayNowTransferState = "SUBMITTED"
-    PayNowSettled   PayNowTransferState = "SETTLED"     // typically <10s
-    PayNowFailed    PayNowTransferState = "FAILED"      // recipient rejection or bank reject
-    PayNowCancelled PayNowTransferState = "CANCELLED"   // pre-submission only
+    OutboundRequested  OutboundBankTransferState = "REQUESTED"
+    OutboundInFlight   OutboundBankTransferState = "IN_FLIGHT"
+    OutboundSettled    OutboundBankTransferState = "SETTLED"
+    OutboundReversed   OutboundBankTransferState = "REVERSED"
+    OutboundFailed     OutboundBankTransferState = "FAILED"
+    OutboundCancelled  OutboundBankTransferState = "CANCELLED"
 )
 
-type PayNowTransferWorkflow = PaymentWorkflow[PayNowTransferRequest, PayNowTransferState]
+type OutboundBankTransferWorkflow = PaymentWorkflow[
+    OutboundBankTransferRequest, OutboundBankTransferState]
 ```
 
-The PayNow state machine is materially simpler than the ACH version
-because the rail is real-time. No PENDING window (FAST settles in
-seconds), no RETURNED terminal (real-time rails fail at submit, not
-post-settlement; reversal requires a separate inverse transfer).
+Rail-specific state machines (PayNow's 5 internal states, ACH's 7
+internal states with PENDING/RETURNED) live in the infrastructure
+adapter that implements OutboundBankTransferWorkflow — NOT in the
+domain. Adding NAPAS or SEPA in v2 means a new adapter file in
+`internal/infrastructure/`, not a new domain file.
 
 ### State transitions
 
@@ -284,28 +323,64 @@ stateDiagram-v2
     ABANDONED --> [*]
 ```
 
-PayNow / FAST transfer (out, SG):
+Outbound bank transfer — **domain-level** abstract state machine
+(rail-agnostic; visible to callers via `Snapshot.State`):
 
 ```mermaid
 stateDiagram-v2
-    [*] --> INITIATED: Start
-    INITIATED --> SUBMITTED: timer (immediate)
-    INITIATED --> CANCELLED: signal.cancel
-    SUBMITTED --> SETTLED: processor.success<br/>(typically <10s)
-    SUBMITTED --> FAILED: processor.reject<br/>OR bank.reject
+    [*] --> REQUESTED: Start
+    REQUESTED --> IN_FLIGHT: adapter.submit
+    REQUESTED --> CANCELLED: signal.cancel
+    REQUESTED --> FAILED: validation.reject
+    IN_FLIGHT --> SETTLED: rail.confirm
+    IN_FLIGHT --> FAILED: rail.reject
+    SETTLED --> REVERSED: rail.return<br/>(ACH-style; not used by real-time rails)
+    SETTLED --> [*]: retention timer
+    REVERSED --> [*]
+    FAILED --> [*]
+    CANCELLED --> [*]
+```
+
+PayNow / FAST adapter — **infra-level** internal state machine that
+drives the domain abstraction (Singapore v1):
+
+```mermaid
+stateDiagram-v2
+    [*] --> INITIATED: Start (domain: REQUESTED)
+    INITIATED --> SUBMITTED: timer (immediate) (domain: IN_FLIGHT)
+    INITIATED --> CANCELLED: signal.cancel (domain: CANCELLED)
+    SUBMITTED --> SETTLED: processor.success<br/>(typically <10s, domain: SETTLED)
+    SUBMITTED --> FAILED: processor.reject<br/>OR bank.reject (domain: FAILED)
     SETTLED --> [*]: 30d retention timer
     FAILED --> [*]
     CANCELLED --> [*]
 ```
 
-Three states-with-outgoing-transitions vs the seven on the US ACH
-machine. The simplicity is a feature of the rail, not the design.
+The PayNow adapter has 5 internal states; the domain only sees the
+6-state abstraction. ACH (parked) would have 7 internal states with
+PENDING and RETURNED but still map to the same 6 domain states. The
+abstraction is the moat — adding NAPAS or SEPA later means another
+infra adapter, not a domain change.
 
 ## v1 design — schema
 
-Per-rail tables, same pattern as before. Each gets its own state
-enum, rail-specific columns, and CHECK constraint enforcing valid
-states.
+Each infrastructure adapter owns its own table. The schema is an
+INFRA concern — different rails store different things and have
+different state shapes. The domain layer doesn't see SQL; it sees
+`PaymentWorkflow[Req,State]`.
+
+Per-adapter tables (each owned by the corresponding adapter in
+`internal/infrastructure/`):
+
+- `card_charges` — owned by Stripe card adapter (or future Adyen/2C2P)
+- `paynow_transfers` — owned by Singapore PayNow adapter
+- (v2) `napas_transfers` — owned by Vietnam NAPAS adapter
+- (v2) `momo_charges` / `gopay_charges` / etc. — owned by per-e-wallet adapters
+
+All adapters publish into the **shared** `outbox_events` and append
+to the shared `workflow_events` audit log. Those two are
+domain-level concerns (any adapter writes audit + outbox the same
+way) and live alongside the per-adapter tables in the same migrations.
 
 ### Migrations
 
@@ -782,29 +857,41 @@ Before scaffolding more code:
 | Concern | Path |
 |---|---|
 | Domain — workflow interface | `internal/domain/workflow.go` ✓ |
-| Domain — Singapore card-in (Stripe) | `internal/domain/card_charge.go` ✓ |
-| Domain — Singapore PayNow-out | `internal/domain/paynow_transfer.go` (TODO: rename from `ach_transfer.go`) |
+| Domain — card-charging (rail-agnostic) | `internal/domain/card_charge.go` ✓ |
+| Domain — outbound bank transfer (rail-agnostic) | `internal/domain/outbound_bank_transfer.go` ✓ |
 | Domain — money + currency | `internal/domain/money.go` ✓ |
 | Domain — sentinel errors | `internal/domain/errors.go` ✓ |
-| Usecases | `internal/usecase/card_charge.go`<br/>`internal/usecase/paynow_transfer.go` |
-| PG-backed workflow adapter (v1) | `internal/infrastructure/workflow_pg.go` |
-| Temporal-backed workflow adapter (v2) | `internal/infrastructure/workflow_temporal.go` |
-| Stripe / PayNow provider clients | `internal/infrastructure/stripe_client.go`<br/>`internal/infrastructure/paynow_client.go` |
-| Webhook signature validation | `internal/transport/http/webhook.go` |
+| Infra — Stripe card adapter (v1) | `internal/infrastructure/stripe_card_adapter.go` |
+| Infra — Singapore PayNow adapter (v1) | `internal/infrastructure/paynow_adapter.go` |
+| Infra — TimerWorker (per-adapter polling) | `internal/infrastructure/timer_worker.go` |
+| Infra — OutboxWorker | `internal/infrastructure/outbox_worker.go` |
+| Infra — LedgerEventConsumer | `internal/infrastructure/ledger_event_consumer.go` |
+| Infra — webhook signature validators | `internal/transport/http/webhook.go` |
+| Usecases | `internal/usecase/card_charge.go`<br/>`internal/usecase/outbound_bank_transfer.go` |
 | gRPC server | `internal/transport/grpc/server.go` |
-| TimerWorker (v1 only) | `internal/infrastructure/timer_worker.go` |
-| OutboxWorker | `internal/infrastructure/outbox_worker.go` |
-| LedgerEventConsumer | `internal/infrastructure/ledger_event_consumer.go` |
 | Migrations | `migrations/001_init_gateway.up.sql` |
 | Server binary | `cmd/server/main.go` |
 | Reconciler binary | `cmd/reconciler/main.go` |
 
-Future SEA additions (v2):
-- `internal/domain/napas_transfer.go` (Vietnam bank-out)
-- `internal/domain/momo_charge.go` (Vietnam e-wallet, similar shape
-  for ZaloPay / GrabPay / GoPay)
-- `internal/domain/qr_payment.go` (PayNow QR / VietQR / QRIS)
-- `internal/domain/aggregator_charge.go` (Xendit / dlocal multi-country)
+Future v2 additions — note **no new domain files** for new rails;
+each rail is a new infrastructure adapter:
+
+- `internal/infrastructure/napas_adapter.go` — Vietnam bank-out
+  (implements `OutboundBankTransferWorkflow`)
+- `internal/infrastructure/ach_adapter.go` — US ACH (parked)
+- `internal/infrastructure/aggregator_adapter.go` — Xendit / dlocal
+  multi-country (implements both card and outbound workflows)
+
+Genuinely new categories (not just new rails) DO get new domain
+files in v2:
+
+- `internal/domain/ewallet_charge.go` — MoMo / GrabPay / GoPay etc.
+  share an OAuth-redirect + webhook-completion pattern that doesn't
+  fit either CardCharge (no auth/capture) or OutboundBankTransfer
+  (different direction). Worth its own kind.
+- `internal/domain/qr_payment.go` — customer-initiated QR scan
+  (PayNow QR / VietQR / QRIS). The "wait for customer to scan"
+  state is unique to this category.
 
 ## Net
 

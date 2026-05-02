@@ -46,4 +46,5 @@ var (
 	ErrAccountRequired     = errors.New("gateway: user account id is required")
 	ErrPaymentMethodEmpty  = errors.New("gateway: payment method token is required")
 	ErrDestinationEmpty    = errors.New("gateway: destination token is required")
+	ErrCountryRequired     = errors.New("gateway: country must be ISO-3166 alpha-2 code")
 )
