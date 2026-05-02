@@ -94,7 +94,8 @@ const (
 )
 
 // ExecuteTransfer atomically writes one Transaction, two JournalEntry legs
-// (debit on FromAccountID, credit on ToAccountID), and one OutboxEvent.
+// (debit on FromAccountID, credit on ToAccountID), one OutboxEvent, and
+// one audit_pending row.
 //
 // Invariants enforced:
 //  1. Currency is a valid ISO-4217-shaped code.
@@ -105,15 +106,24 @@ const (
 // Atomicity model:
 //
 //	BEGIN ISOLATION LEVEL SERIALIZABLE
+//	  -- single round-trip via pgx batched protocol (SendBatch):
 //	  INSERT transactions
 //	  INSERT journal_entries (debit)
 //	  INSERT journal_entries (credit)
 //	  INSERT outbox_events
+//	  INSERT audit_pending
 //	COMMIT
 //
+// All five inserts pipeline into one network round-trip — ~5 RTTs of
+// per-tx latency saved over the unbatched path, which both lifts the
+// pool-saturation TPS ceiling and shrinks the SERIALIZABLE snapshot
+// window (so hot-account 40001 conflicts get a smaller hit-rate bonus).
+//
 // On SQLSTATE 40001 the wrapper retries the entire block. The outbox
-// insert participates in the SAME transaction, which is the whole point
-// of the Transactional Outbox pattern: ledger durability ⟺ event durability.
+// insert participates in the SAME transaction — the whole point of the
+// Transactional Outbox pattern: ledger durability ⟺ event durability.
+// audit_pending is written in the same tx for the same reason: a
+// committed ledger row never exists without its audit row enqueued.
 func (r *LedgerRepo) ExecuteTransfer(ctx context.Context, req domain.TransferRequest) (*domain.Transaction, error) {
 	if err := r.validateTransferRequest(req); err != nil {
 		return nil, err
@@ -166,61 +176,61 @@ func (r *LedgerRepo) ExecuteTransfer(ctx context.Context, req domain.TransferReq
 		return nil, ErrCircuitOpen
 	}
 
-	err := InTx(ctx, r.pool, r.acquireCfg, r.retry, r.metrics, func(ctx context.Context, tx pgx.Tx) error {
-		if _, err := tx.Exec(ctx, insertTransactionSQL,
+	// Build the audit event up front so envelope validation fails the
+	// request before we open a tx (saves one pool acquire on bad input).
+	// canonicalTransactionAudit is pure CPU — no DB round-trip.
+	auditBody, err := canonicalTransactionAudit(transaction)
+	if err != nil {
+		return nil, fmt.Errorf("audit: canonicalize transaction: %w", err)
+	}
+	auditEvt := domain.AuditEvent{
+		AuditEnvelope: req.AuditEnvelope,
+		AggregateType: domain.AuditAggregateTransaction,
+		AggregateID:   transaction.ID,
+		Operation:     domain.AuditOpTransferExecuted,
+		BeforeState:   nil, // INSERT — no prior state
+		AfterState:    auditBody,
+	}
+	if err := validateAuditEnvelope(auditEvt); err != nil {
+		return nil, err
+	}
+
+	err = InTx(ctx, r.pool, r.acquireCfg, r.retry, r.metrics, func(ctx context.Context, tx pgx.Tx) error {
+		// All five inserts go in one round-trip via pgx's batched
+		// protocol. Order is load-bearing: classifyBatchErr maps the
+		// failing-statement index back to the right domain error
+		// (UNIQUE on transactions → ErrDuplicateIdempotencyKey,
+		// composite FK on journal_entries → ErrAccountTenantMismatch).
+		batch := &pgx.Batch{}
+		batch.Queue(insertTransactionSQL,
 			transaction.ID, transaction.TenantID, transaction.IdempotencyKey,
 			transaction.RequestFingerprint,
 			string(transaction.Status), transaction.CreatedAt,
-		); err != nil {
-			if IsUniqueViolation(err) {
-				return domain.ErrDuplicateIdempotencyKey
-			}
-			return fmt.Errorf("insert transaction: %w", err)
-		}
-
+		)
 		for i := range transaction.Entries {
 			leg := transaction.Entries[i]
-			if _, err := tx.Exec(ctx, insertJournalEntrySQL,
+			batch.Queue(insertJournalEntrySQL,
 				leg.ID, leg.TransactionID, leg.TenantID, leg.AccountID,
 				leg.Amount, string(leg.Currency), leg.CreatedAt,
-			); err != nil {
-				// Composite FKs reject cross-tenant accounts and tx/leg
-				// tenant mismatches at insert time. Mapping the FK
-				// violation here keeps the policy decision in the domain.
-				if IsForeignKeyViolation(err) {
-					return domain.ErrAccountTenantMismatch
-				}
-				return fmt.Errorf("insert journal entry: %w", err)
-			}
+			)
 		}
-
-		if _, err := tx.Exec(ctx, insertOutboxEventSQL,
+		batch.Queue(insertOutboxEventSQL,
 			outboxID, string(domain.AggregateTypeTransaction),
 			transaction.ID, req.OutboxSchema, req.OutboxPayload,
 			string(domain.OutboxStatusPending), now,
-		); err != nil {
-			return fmt.Errorf("insert outbox event: %w", err)
-		}
+		)
+		batch.Queue(insertAuditPendingSQL, auditPendingArgs(auditEvt)...)
 
-		// Audit row — tamper-evident chain link, committed in the same
-		// tx so the ledger write is atomic with its own audit. Failure
-		// here rolls back the ledger write rather than leaving an
-		// un-audited transaction on disk.
-		auditBody, err := canonicalTransactionAudit(transaction)
-		if err != nil {
-			return fmt.Errorf("audit: canonicalize transaction: %w", err)
+		// SendBatch pipelines the queued statements; results come back
+		// in queue order. Each Exec() must be drained — skipping one
+		// blocks the next. defer Close releases pgx's batch state.
+		br := tx.SendBatch(ctx, batch)
+		defer br.Close()
+		for i := 0; i < batch.Len(); i++ {
+			if _, err := br.Exec(); err != nil {
+				return classifyBatchErr(err, i)
+			}
 		}
-		if err := writeAuditEvent(ctx, tx, domain.AuditEvent{
-			AuditEnvelope: req.AuditEnvelope,
-			AggregateType: domain.AuditAggregateTransaction,
-			AggregateID:   transaction.ID,
-			Operation:     domain.AuditOpTransferExecuted,
-			BeforeState:   nil, // INSERT — no prior state
-			AfterState:    auditBody,
-		}); err != nil {
-			return err
-		}
-
 		return nil
 	})
 	// Feed breaker outcome before returning. capReached=true is the
@@ -291,6 +301,40 @@ func (r *LedgerRepo) loadTransaction(ctx context.Context, headerSQL string, args
 		return nil, fmt.Errorf("repository: iterate journal entries: %w", err)
 	}
 	return &t, nil
+}
+
+// classifyBatchErr maps an error from a queued INSERT in
+// ExecuteTransfer's pgx.Batch back to the right domain error based on
+// which statement failed. The index is the position in the batch; the
+// order is locked by the Queue() calls in ExecuteTransfer:
+//
+//	0: INSERT transactions       — UNIQUE → ErrDuplicateIdempotencyKey
+//	1: INSERT journal_entries#1  — FK     → ErrAccountTenantMismatch
+//	2: INSERT journal_entries#2  — FK     → ErrAccountTenantMismatch
+//	3: INSERT outbox_events
+//	4: INSERT audit_pending
+//
+// Mirroring the unbatched path's per-statement error mapping keeps
+// callers (the usecase) blind to whether the repo pipelines or not.
+func classifyBatchErr(err error, idx int) error {
+	switch idx {
+	case 0:
+		if IsUniqueViolation(err) {
+			return domain.ErrDuplicateIdempotencyKey
+		}
+		return fmt.Errorf("insert transaction: %w", err)
+	case 1, 2:
+		if IsForeignKeyViolation(err) {
+			return domain.ErrAccountTenantMismatch
+		}
+		return fmt.Errorf("insert journal entry: %w", err)
+	case 3:
+		return fmt.Errorf("insert outbox event: %w", err)
+	case 4:
+		return fmt.Errorf("audit: enqueue pending: %w", err)
+	default:
+		return fmt.Errorf("batch insert idx=%d: %w", idx, err)
+	}
 }
 
 func (r *LedgerRepo) validateTransferRequest(req domain.TransferRequest) error {

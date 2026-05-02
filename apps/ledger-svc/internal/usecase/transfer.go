@@ -17,12 +17,12 @@ import (
 
 // TransferUsecase orchestrates a single ledger transfer end-to-end:
 //
-//	1. Validate input.
-//	2. Pre-flight balance assertion (Debit + Credit == 0).
-//	3. Atomic Redis SETNX on the idempotency key.
-//	4. Repository.ExecuteTransfer — atomic PG tx that writes the
-//	   transaction, both journal_entries, AND the outbox event.
-//	5. Update Redis state (COMPLETED / FAILED).
+//  1. Validate input.
+//  2. Pre-flight balance assertion (Debit + Credit == 0).
+//  3. Atomic Redis SETNX on the idempotency key.
+//  4. Repository.ExecuteTransfer — atomic PG tx that writes the
+//     transaction, both journal_entries, AND the outbox event.
+//  5. Update Redis state (COMPLETED / FAILED).
 //
 // Replay path: on duplicate (Redis says COMPLETED, OR PG UNIQUE caught a
 // late duplicate) the original transaction is loaded and returned with

@@ -78,14 +78,14 @@ const (
 		SELECT MIN(enqueued_at) FROM audit_pending`
 )
 
-// writeAuditEvent enqueues one audit event into audit_pending inside the
-// caller's tx — atomic with the ledger write. The hash chain is computed
-// later by AuditWorker, NOT here. This keeps the SERIALIZABLE block free
-// of the per-tenant chain head SELECT that used to dominate p99.
+// validateAuditEnvelope returns an error if e is missing required
+// identity fields. Pulled out so callers using the batched write path
+// can fail fast pre-tx, without contaminating a pgx.Batch with a
+// known-bad row whose error would surface mid-pipeline.
 //
-// Empty required fields fail fast — silent anonymization is the failure
-// mode an audit log must not allow.
-func writeAuditEvent(ctx context.Context, tx pgx.Tx, e domain.AuditEvent) error {
+// Empty required fields are a hard error — silent anonymization is the
+// failure mode an audit log must not allow.
+func validateAuditEnvelope(e domain.AuditEvent) error {
 	if e.TenantID == "" || e.ActorSubject == "" || e.RequestID == "" {
 		return fmt.Errorf("audit: envelope incomplete (tenant=%q subject=%q req=%q)",
 			e.TenantID, e.ActorSubject, e.RequestID)
@@ -93,17 +93,21 @@ func writeAuditEvent(ctx context.Context, tx pgx.Tx, e domain.AuditEvent) error 
 	if e.AggregateType == "" || e.Operation == "" {
 		return fmt.Errorf("audit: aggregate_type and operation are required")
 	}
+	return nil
+}
 
-	if _, err := tx.Exec(ctx, insertAuditPendingSQL,
+// auditPendingArgs returns the positional args that match
+// insertAuditPendingSQL. Used by the request-path batch in
+// ExecuteTransfer to keep the audit insert co-located with the rest of
+// the ledger writes in a single pgx.Batch round-trip.
+func auditPendingArgs(e domain.AuditEvent) []any {
+	return []any{
 		e.TenantID, e.OccurredAt,
 		e.ActorSubject, e.ActorSession,
 		e.RequestID, e.TraceID,
 		e.AggregateType, e.AggregateID, e.Operation,
 		e.BeforeState, e.AfterState,
-	); err != nil {
-		return fmt.Errorf("audit: enqueue pending: %w", err)
 	}
-	return nil
 }
 
 // PendingAuditRow is one claimed row from audit_pending, ready for the
