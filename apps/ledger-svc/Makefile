@@ -204,11 +204,37 @@ profile-analyze-cpu:  ## Open the latest CPU profile in pprof's web UI (port 888
 	go tool pprof -http=:8888 "$$latest"
 
 .PHONY: profile-analyze-heap
-profile-analyze-heap:  ## Open the latest heap profile in pprof's web UI (port 8888)
+profile-analyze-heap:  ## Open the latest heap profile in pprof's web UI (port 8889)
 	@latest=$$(ls -t $(PPROF_DIR)/heap-*.pb.gz 2>/dev/null | head -1); \
 	if [ -z "$$latest" ]; then echo "no heap profile; run profile-heap first" >&2; exit 1; fi; \
 	echo "opening $$latest"; \
-	go tool pprof -http=:8888 "$$latest"
+	go tool pprof -http=:8889 "$$latest"
+
+.PHONY: profile-analyze-allocs
+profile-analyze-allocs:  ## Open the latest allocs profile in pprof's web UI (port 8890)
+	@latest=$$(ls -t $(PPROF_DIR)/allocs-*.pb.gz 2>/dev/null | head -1); \
+	if [ -z "$$latest" ]; then echo "no allocs profile; run profile-allocs first" >&2; exit 1; fi; \
+	echo "opening $$latest"; \
+	go tool pprof -http=:8890 "$$latest"
+
+# Goroutine dumps are text (?debug=2 from /debug/pprof/goroutine), not
+# pprof binary. Rather than open in a web UI, this prints a quick
+# state-distribution summary then pages the full dump. The summary is
+# the "are we leaking / what's stuck" view; the pager is the "give me
+# the actual stack traces" view.
+.PHONY: profile-analyze-goroutines
+profile-analyze-goroutines:  ## Summary + pager view of the latest goroutine dump
+	@latest=$$(ls -t $(PPROF_DIR)/goroutines-*.txt 2>/dev/null | head -1); \
+	if [ -z "$$latest" ]; then echo "no goroutine dump; run profile-goroutines first" >&2; exit 1; fi; \
+	echo "==== $$latest ===="; \
+	echo "total goroutines: $$(grep -c '^goroutine ' "$$latest")"; \
+	echo ""; \
+	echo "by state (top 10):"; \
+	awk -F'[][]' '/^goroutine [0-9]+ \[/ {split($$2, a, ","); print a[1]}' "$$latest" \
+		| sort | uniq -c | sort -rn | head -10; \
+	echo ""; \
+	echo "opening in $${PAGER:-less}..."; \
+	$${PAGER:-less} "$$latest"
 
 .PHONY: profile-diff-cpu
 profile-diff-cpu:  ## Diff two CPU profiles (PPROF_BASE=path PPROF_NEW=path; absolute, repo-relative, or svc-relative all work)
