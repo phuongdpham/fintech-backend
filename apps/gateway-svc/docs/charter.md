@@ -76,6 +76,79 @@ gateway-svc → outbox → Kafka topic gateway.events → ledger-svc consumes
 Loose coupling — either service can be down without corrupting the
 other's state. Both consume idempotently.
 
+### Storage isolation — gateway-svc owns its own Postgres
+
+gateway-svc does NOT share a database with ledger-svc. Each service
+runs against its own PG cluster (`ledger-db` and `gateway-db` in
+docker-compose; separate clusters in production). Five reasons in
+priority order:
+
+1. **DDD bounded-context isolation.** ledger-svc owns the
+   journal/transactions/audit aggregate; gateway-svc owns the
+   card-charges/outbound-transfers/workflow-events aggregate.
+   Different bounded contexts → different storage. Sharing a DB is
+   the classic "microservices-shaped monolith" anti-pattern — looks
+   distributed, coupled at the schema in practice.
+
+2. **Failure isolation.** A runaway gateway query (long SELECT over
+   a 7-day card-charge window, autovacuum storm on
+   `workflow_events`) shouldn't be able to fill `pg_stat_activity`,
+   exhaust connections, or trigger I/O storms that affect
+   ledger-svc's hot path. Separate PG instances put a real fence
+   between the failure domains.
+
+3. **Independent scaling and tuning.** ledger-svc wants 4GB+
+   `shared_buffers`, `synchronous_commit=on`, aggressive autovacuum
+   on `journal_entries` / `outbox_events`. gateway-svc wants longer
+   `statement_timeout` (waiting on processor APIs), looser
+   autovacuum (lower churn), `work_mem` tuned for analytical reads
+   on `workflow_events`. These are mutually exclusive on one
+   cluster.
+
+4. **Schema autonomy.** Each service's migrations land independently;
+   neither team needs sign-off from the other. Separate migration
+   directories already exist (`apps/<svc>/migrations/`); the right
+   design has them target different DBs, not different schemas in
+   the same DB.
+
+5. **PCI / regulatory blast radius.** If gateway-svc ever holds
+   card-related data (even tokenized PANs from a processor with
+   loose tokenization), the auditor's question is "show me
+   everything that database touches." Cleaner answer when the DB
+   only contains gateway-svc's tables. ledger-svc stays out of PCI
+   scope by construction.
+
+#### What stays shared
+
+Not everything splits. The boundary is "stateful storage that holds
+your domain aggregates is yours; the bus between services is shared":
+
+| Resource | Per-service or shared | Why |
+|---|---|---|
+| **Postgres** | per-service | the bounded-context aggregate lives here |
+| **Redis** (idempotency / cache) | per-service keyspaces (shared cluster OK with prefix) | each service has its own keys; namespace by prefix |
+| **Kafka / Redpanda** | shared cluster, distinct topics | the inter-service bus by definition |
+| **OTel collector** | shared | observability is cross-cutting |
+| **Metrics listener** | per-service (different ports) | already is |
+
+#### Connection coords
+
+Each service's `internal/config/config.go` reads from its own struct
+tags — Go's `internal/` rule prevents sharing the config package
+across `apps/`. So:
+
+```go
+// apps/ledger-svc/internal/config/config.go
+URL string `env:"LEDGER_DATABASE_URL,required"`
+
+// apps/gateway-svc/internal/config/config.go (future)
+URL string `env:"GATEWAY_DATABASE_URL,required"`
+```
+
+Root `.env` (or per-service `.env` — see env.example) lists both
+URLs. They point at different PG instances on different ports
+(`:5432` and `:5433` in dev compose).
+
 ## Regional strategy — SEA-first
 
 Three things make SEA payments structurally different from US:
